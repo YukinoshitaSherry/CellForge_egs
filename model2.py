@@ -1,11 +1,3 @@
-"""
-CondOT-GRN Model for Single-Cell Perturbation Prediction
-Based on drug1.md specifications for Srivatsan sci-Plex dataset
-
-This script implements a Conditional Optimal Transport with Gene Regulatory Network priors
-for predicting single-cell transcriptional responses to chemical perturbations.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -89,6 +81,12 @@ class GeneExpressionDataset(Dataset):
         data = np.clip(data, -10, 10)
         data = data / 10.0
 
+        
+        
+        
+        self.original_expression_data = data.copy()
+        self.n_genes = data.shape[1]
+
         if pca_model is None:
             if fit_pca:
                 self.pca = PCA(n_components=pca_dim)
@@ -107,6 +105,7 @@ class GeneExpressionDataset(Dataset):
         self.perturbation_names = list(adata.obs[perturbation_key].unique())
         
         perturbation_labels = adata.obs[perturbation_key].astype(str).values
+        
         perturbation_labels = np.array(perturbation_labels, dtype='U')
         lower_labels = np.char.lower(perturbation_labels)
         negctrl_mask = np.char.find(lower_labels, 'negctrl') >= 0
@@ -156,40 +155,60 @@ class GeneExpressionDataset(Dataset):
             
             if len(self._non_control_pert_names) > 0 and len(self._non_control_indices) > 0:
                 
-                pert_name = self._non_control_pert_names[idx % len(self._non_control_pert_names)]
+                if self.is_train:
+                    
+                    pert_name = np.random.choice(self._non_control_pert_names)
+                else:
+                    
+                    pert_name = self._non_control_pert_names[idx % len(self._non_control_pert_names)]
                 
                 if pert_name in self._pert_to_indices and len(self._pert_to_indices[pert_name]) > 0:
                     pert_indices = self._pert_to_indices[pert_name]
+                    if self.is_train:
+                        target_idx = int(np.random.choice(pert_indices))
+                    else:
+                        target_idx = int(pert_indices[(idx // len(self._non_control_pert_names)) % len(pert_indices)])
                     
-                    target_idx = int(pert_indices[(idx // len(self._non_control_pert_names)) % len(pert_indices)])
-                    x_target = self.expression_data[target_idx]
+                    x_target = self.original_expression_data[target_idx]
                     pert_target = self.perturbations[target_idx]
                     dose_target = self.dose_values[target_idx]
                 else:
+                    if self.is_train:
+                        target_idx = int(np.random.choice(self._non_control_indices))
+                    else:
+                        target_idx = int(self._non_control_indices[idx % len(self._non_control_indices)])
                     
-                    target_idx = int(self._non_control_indices[idx % len(self._non_control_indices)])
-                    x_target = self.expression_data[target_idx]
+                    x_target = self.original_expression_data[target_idx]
                     pert_target = self.perturbations[target_idx]
                     dose_target = self.dose_values[target_idx]
             else:
                 
                 alternative_controls = self._control_indices[self._control_indices != idx]
                 if len(alternative_controls) > 0:
-                    target_idx = int(alternative_controls[idx % len(alternative_controls)])
-                    x_target = self.expression_data[target_idx]
+                    if self.is_train:
+                        target_idx = int(np.random.choice(alternative_controls))
+                    else:
+                        target_idx = int(alternative_controls[idx % len(alternative_controls)])
+                    
+                    x_target = self.original_expression_data[target_idx]
                     pert_target = self.perturbations[target_idx]
                     dose_target = self.dose_values[target_idx]
                 else:
                     
-                    x_target = x_baseline
+                    
+                    x_target = self.original_expression_data[idx]
                     pert_target = pert
                     dose_target = dose
         else:
             
             if len(self._control_indices) > 0:
-                baseline_idx = int(self._control_indices[idx % len(self._control_indices)])
+                if self.is_train:
+                    baseline_idx = int(np.random.choice(self._control_indices))
+                else:
+                    baseline_idx = int(self._control_indices[idx % len(self._control_indices)])
                 x_baseline = self.expression_data[baseline_idx]
-            x_target = self.expression_data[idx]
+            
+            x_target = self.original_expression_data[idx]
             pert_target = pert
             dose_target = dose
 
@@ -204,8 +223,12 @@ class GeneExpressionDataset(Dataset):
         x_baseline = x_baseline.astype(np.float32)
         pert_target = pert_target.astype(np.float32)
         dose_target = np.float32(dose_target)
+        
+        
+        
+        x_target_pca = self.pca.transform(x_target.reshape(1, -1)).flatten()
 
-        return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor([dose_target]), torch.FloatTensor(x_target)
+        return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor([dose_target]), torch.FloatTensor(x_target), torch.FloatTensor(x_target_pca)
 
 class GeneEncoder(nn.Module):
     """Gene expression encoder with attention mechanism"""
@@ -462,12 +485,13 @@ class GeneDecoder(nn.Module):
 class CondOTGRNModel(nn.Module):
     """Conditional Optimal Transport with GRN priors model"""
 
-    def __init__(self, input_dim, pert_dim, dose_dim=1, latent_dim=128, chem_dim=64,
+    def __init__(self, input_dim, output_dim, pert_dim, dose_dim=1, latent_dim=128, chem_dim=64,
                  hidden_dim=512, n_heads=8, n_layers=2, dropout=0.1,
                  ot_eps=0.1, ot_max_iter=50, flow_layers=6):
         super(CondOTGRNModel, self).__init__()
 
         self.input_dim = input_dim
+        self.output_dim = output_dim  
         self.pert_dim = pert_dim
         self.dose_dim = dose_dim
         self.latent_dim = latent_dim
@@ -482,7 +506,7 @@ class CondOTGRNModel(nn.Module):
         self.flow_refiner = FlowRefiner(
             latent_dim, chem_dim, flow_layers, hidden_dim)
         self.gene_decoder = GeneDecoder(
-            latent_dim, input_dim, hidden_dim, n_modules=10, dropout=dropout)
+            latent_dim, output_dim, hidden_dim, n_modules=10, dropout=dropout)  
 
         self.apply(self._init_weights)
 
@@ -515,14 +539,14 @@ class CondOTGRNModel(nn.Module):
         z_control = self.gene_encoder(x_control)
         p = self.chem_encoder(pert, dose)
 
-        # CRITICAL: Always use the same forward path (no ground-truth target in forward)
-        # This ensures train/test consistency and avoids identity learning
-        # OT and flow supervision are provided via detached latent in train_model
+        
+        
+        
         noise_scale = torch.norm(p, dim=1, keepdim=True) * 0.1
         noise = torch.randn_like(z_control) * noise_scale
         z_refined = z_control + noise
         
-        # Apply flow refiner to z_refined
+        
         z_refined, log_det_jac = self.flow_refiner(z_refined, p)
 
         x_pred = self.gene_decoder(z_refined)
@@ -532,7 +556,7 @@ class CondOTGRNModel(nn.Module):
             'z_control': z_control,
             'z_refined': z_refined,
             'p': p,
-            'transport_plan': None,  # Will be computed in train_model with detached target
+            'transport_plan': None,  
             'log_det_jac': log_det_jac
         }
 
@@ -554,44 +578,40 @@ def train_model(model, train_loader, optimizer, scheduler, device, loss_weights=
         }
 
     for i, batch in enumerate(tqdm(train_loader, desc="Training", leave=False)):
-        x_baseline, pert, dose, x_target = batch
-        x_baseline, pert, dose, x_target = x_baseline.to(
-            device), pert.to(device), dose.to(device), x_target.to(device)
+        x_baseline, pert, dose, x_target, x_target_pca = batch
+        x_baseline, pert, dose, x_target, x_target_pca = x_baseline.to(
+            device), pert.to(device), dose.to(device), x_target.to(device), x_target_pca.to(device)
 
-        diff = (x_baseline - x_target).pow(2).mean(dim=1)
-        valid_mask = diff > 1e-6
-        if not torch.any(valid_mask):
-            continue
-        x_baseline = x_baseline[valid_mask]
-        pert = pert[valid_mask]
-        dose = dose[valid_mask]
-        x_target = x_target[valid_mask]
+        
+        
+        
 
-        # CRITICAL FIX: Use detached latent supervision for OT/flow training
-        # Forward path does NOT use x_target to avoid information leakage
-        # This ensures train/test consistency and prevents identity learning
+        
+        
+        
         outputs = model(x_baseline, pert, dose, is_training=True)
 
-        # Reconstruction loss: predicted vs target
+        
         recon_loss = F.mse_loss(outputs['x_pred'], x_target)
 
-        # OT and Flow supervision using detached target latent
-        # This provides supervision signal without information leakage
-        with torch.no_grad():
-            # Compute target latent without gradient flow (detached)
-            z_target = model.gene_encoder(x_target)
         
-        # OT loss: compute transport plan using detached z_target
-        # This trains the OT module without leaking information to the forward path
-        # The OT module learns to transport from z_control to z_target conditioned on pert
+        
+        with torch.no_grad():
+            
+            
+            z_target = model.gene_encoder(x_target_pca)
+        
+        
+        
+        
         z_ot_pred, transport_plan = model.conditional_ot(
             outputs['z_control'], z_target.detach(), outputs['p'])
-        # OT loss: encourage sparse transport plan (regularization)
+        
         ot_loss = torch.trace(torch.mm(transport_plan, transport_plan.t()))
         
-        # Flow loss: encourage z_refined to match z_ot_pred (which aligns with detached z_target)
-        # This trains the flow module to refine towards the correct target distribution
-        # z_ot_pred is detached to prevent gradient flow back to OT, but provides supervision signal
+        
+        
+        
         flow_loss = F.mse_loss(outputs['z_refined'], z_ot_pred.detach()) - outputs['log_det_jac'].mean()
 
         de_loss = recon_loss
@@ -626,7 +646,6 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
     total_loss = 0
     total_r2 = 0
     total_pearson = 0
-    valid_batches = 0
 
     if loss_weights is None:
         loss_weights = {
@@ -640,18 +659,12 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating", leave=False):
-            x_baseline, pert, dose, x_target = batch
-            x_baseline, pert, dose, x_target = x_baseline.to(
-                device), pert.to(device), dose.to(device), x_target.to(device)
+            x_baseline, pert, dose, x_target, x_target_pca = batch
+            x_baseline, pert, dose, x_target, x_target_pca = x_baseline.to(
+                device), pert.to(device), dose.to(device), x_target.to(device), x_target_pca.to(device)
 
-            diff = (x_baseline - x_target).pow(2).mean(dim=1)
-            valid_mask = diff > 1e-6
-            if not torch.any(valid_mask):
-                continue
-            x_baseline = x_baseline[valid_mask]
-            pert = pert[valid_mask]
-            dose = dose[valid_mask]
-            x_target = x_target[valid_mask]
+            
+            
 
             outputs = model(x_baseline, pert, dose, is_training=False)
 
@@ -676,7 +689,6 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
                     loss_weights['reg'] * reg_loss)
 
             total_loss += loss.item()
-            valid_batches += 1
 
             x_target_np = x_target.cpu().numpy()
             x_pred_np = outputs['x_pred'].cpu().numpy()
@@ -704,13 +716,10 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
             total_r2 += r2
             total_pearson += pearson
 
-    if valid_batches == 0:
-        return {'loss': float('nan'), 'r2': float('nan'), 'pearson': float('nan')}
-
     return {
-        'loss': total_loss / valid_batches,
-        'r2': total_r2 / valid_batches,
-        'pearson': total_pearson / valid_batches
+        'loss': total_loss / len(test_loader),
+        'r2': total_r2 / len(test_loader),
+        'pearson': total_pearson / len(test_loader)
     }
 
 def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None):
@@ -728,20 +737,40 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None)
     """
     n_samples, n_genes = true.shape
     
+    
     mse = np.mean((pred - true) ** 2)
     
-    pred_flat = pred.flatten()
-    true_flat = true.flatten()
-    if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
-        pcc = pearsonr(true_flat, pred_flat)[0]
+    
+    
+    
+    
+    true_mean_per_gene = np.mean(true, axis=0)  
+    pred_mean_per_gene = np.mean(pred, axis=0)  
+    
+    
+    true_centered = true - true_mean_per_gene  
+    pred_centered = pred - pred_mean_per_gene  
+    
+    
+    numerator = np.sum(true_centered * pred_centered)
+    
+    
+    true_norm = np.sqrt(np.sum(true_centered ** 2))
+    pred_norm = np.sqrt(np.sum(pred_centered ** 2))
+    
+    if true_norm > 1e-10 and pred_norm > 1e-10:
+        pcc = numerator / (true_norm * pred_norm)
         if np.isnan(pcc):
             pcc = 0.0
     else:
         pcc = 0.0
     
-    true_mean_overall = np.mean(true)  
+    
+    
+    
+    true_mean_vector = np.mean(true, axis=0)  
     ss_res = np.sum((true - pred) ** 2)  
-    ss_tot = np.sum((true - true_mean_overall) ** 2)  
+    ss_tot = np.sum((true - true_mean_vector) ** 2)  
     if ss_tot > 1e-10:
         r2 = 1.0 - (ss_res / ss_tot)
     else:
@@ -754,20 +783,34 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None)
         de_mask = np.zeros(n_genes, dtype=bool)
         de_mask[de_genes] = True
         if np.any(de_mask):
+            
             mse_de = np.mean((pred[:, de_mask] - true[:, de_mask]) ** 2)
             
-            pred_de_flat = pred[:, de_mask].flatten()
-            true_de_flat = true[:, de_mask].flatten()
-            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
-                pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
+            
+            true_de = true[:, de_mask]  
+            pred_de = pred[:, de_mask]  
+            
+            true_de_mean_per_gene = np.mean(true_de, axis=0)  
+            pred_de_mean_per_gene = np.mean(pred_de, axis=0)  
+            
+            true_de_centered = true_de - true_de_mean_per_gene
+            pred_de_centered = pred_de - pred_de_mean_per_gene
+            
+            numerator_de = np.sum(true_de_centered * pred_de_centered)
+            true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
+            pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
+            
+            if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
+                pcc_de = numerator_de / (true_de_norm * pred_de_norm)
                 if np.isnan(pcc_de):
                     pcc_de = 0.0
             else:
                 pcc_de = 0.0
             
-            true_de_mean_overall = np.mean(true[:, de_mask])  
-            ss_res_de = np.sum((true[:, de_mask] - pred[:, de_mask]) ** 2)
-            ss_tot_de = np.sum((true[:, de_mask] - true_de_mean_overall) ** 2)
+            
+            true_de_mean_vector = np.mean(true_de, axis=0)  
+            ss_res_de = np.sum((true_de - pred_de) ** 2)
+            ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
             if ss_tot_de > 1e-10:
                 r2_de = 1.0 - (ss_res_de / ss_tot_de)
             else:
@@ -791,20 +834,34 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None)
         de_mask[top_k_indices] = True
         
         if np.any(de_mask):
+            
             mse_de = np.mean((pred[:, de_mask] - true[:, de_mask]) ** 2)
             
-            pred_de_flat = pred[:, de_mask].flatten()
-            true_de_flat = true[:, de_mask].flatten()
-            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
-                pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
+            
+            true_de = true[:, de_mask]  
+            pred_de = pred[:, de_mask]  
+            
+            true_de_mean_per_gene = np.mean(true_de, axis=0)  
+            pred_de_mean_per_gene = np.mean(pred_de, axis=0)  
+            
+            true_de_centered = true_de - true_de_mean_per_gene
+            pred_de_centered = pred_de - pred_de_mean_per_gene
+            
+            numerator_de = np.sum(true_de_centered * pred_de_centered)
+            true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
+            pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
+            
+            if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
+                pcc_de = numerator_de / (true_de_norm * pred_de_norm)
                 if np.isnan(pcc_de):
                     pcc_de = 0.0
             else:
                 pcc_de = 0.0
             
-            true_de_mean_overall = np.mean(true[:, de_mask])  
-            ss_res_de = np.sum((true[:, de_mask] - pred[:, de_mask]) ** 2)
-            ss_tot_de = np.sum((true[:, de_mask] - true_de_mean_overall) ** 2)
+            
+            true_de_mean_vector = np.mean(true_de, axis=0)  
+            ss_res_de = np.sum((true_de - pred_de) ** 2)
+            ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
             if ss_tot_de > 1e-10:
                 r2_de = 1.0 - (ss_res_de / ss_tot_de)
             else:
@@ -818,26 +875,44 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None)
         std = np.std(true, axis=0)
         de_mask = np.abs(true - np.mean(true, axis=0)) > std
         if np.any(de_mask):
-            mse_de = np.mean((pred[de_mask] - true[de_mask]) ** 2)
             
-            pred_de_flat = pred[de_mask].flatten()
-            true_de_flat = true[de_mask].flatten()
-            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
-                pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
-                if np.isnan(pcc_de):
+            de_genes_indices = np.where(np.any(de_mask, axis=0))[0]  
+            if len(de_genes_indices) > 0:
+                true_de = true[:, de_genes_indices]  
+                pred_de = pred[:, de_genes_indices]  
+                
+                mse_de = np.mean((pred_de - true_de) ** 2)
+                
+                
+                true_de_mean_per_gene = np.mean(true_de, axis=0)  
+                pred_de_mean_per_gene = np.mean(pred_de, axis=0)  
+                
+                true_de_centered = true_de - true_de_mean_per_gene
+                pred_de_centered = pred_de - pred_de_mean_per_gene
+                
+                numerator_de = np.sum(true_de_centered * pred_de_centered)
+                true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
+                pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
+                
+                if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
+                    pcc_de = numerator_de / (true_de_norm * pred_de_norm)
+                    if np.isnan(pcc_de):
+                        pcc_de = 0.0
+                else:
                     pcc_de = 0.0
+                
+                
+                true_de_mean_vector = np.mean(true_de, axis=0)  
+                ss_res_de = np.sum((true_de - pred_de) ** 2)
+                ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
+                if ss_tot_de > 1e-10:
+                    r2_de = 1.0 - (ss_res_de / ss_tot_de)
+                else:
+                    r2_de = 0.0
+                if np.isnan(r2_de):
+                    r2_de = 0.0
             else:
-                pcc_de = 0.0
-            
-            true_de_mean = np.mean(true[de_mask])
-            ss_res_de = np.sum((pred[de_mask] - true[de_mask]) ** 2)
-            ss_tot_de = np.sum((true[de_mask] - true_de_mean) ** 2)
-            if ss_tot_de > 1e-10:
-                r2_de = 1.0 - (ss_res_de / ss_tot_de)
-            else:
-                r2_de = 0.0
-            if np.isnan(r2_de):
-                r2_de = 0.0
+                mse_de = pcc_de = r2_de = np.nan
         else:
             mse_de = pcc_de = r2_de = np.nan
 
@@ -883,8 +958,13 @@ def objective(trial, timestamp):
     max_pert_dim, all_pert_names = standardize_perturbation_encoding(
         train_dataset, test_dataset)
 
+    
+    n_genes = train_dataset.n_genes
+    print_log(f"Model input dim (PCA): 128, Model output dim (full genes): {n_genes}")
+
     model = CondOTGRNModel(
         input_dim=128,
+        output_dim=n_genes,  
         pert_dim=max_pert_dim,
         dose_dim=1,
         latent_dim=params['latent_dim'],
@@ -975,9 +1055,9 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
-            x_baseline, pert, dose, x_target = batch
-            x_baseline, pert, dose, x_target = x_baseline.to(
-                device), pert.to(device), dose.to(device), x_target.to(device)
+            x_baseline, pert, dose, x_target, x_target_pca = batch
+            x_baseline, pert, dose, x_target, x_target_pca = x_baseline.to(
+                device), pert.to(device), dose.to(device), x_target.to(device), x_target_pca.to(device)
 
             outputs = model(x_baseline, pert, dose, is_training=False)
             x_pred = outputs['x_pred']
@@ -992,7 +1072,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
     all_perturbations = np.concatenate(all_perturbations, axis=0)
     all_baselines = np.concatenate(all_baselines, axis=0)
 
-    control_baseline = all_baselines
+    control_baseline = all_baselines  
     
     results = calculate_detailed_metrics(all_predictions, all_targets, control_baseline=control_baseline)
 
@@ -1035,25 +1115,6 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
 
     return results
 
-def validate_data_consistency(train_adata, test_adata):
-    """Validate consistency between training and test datasets"""
-    train_pert = set(train_adata.obs['perturbation'].unique())
-    test_pert = set(test_adata.obs['perturbation'].unique())
-
-    print_log(
-        f"Number of perturbation types in training set: {len(train_pert)}")
-    print_log(f"Number of perturbation types in test set: {len(test_pert)}")
-    print_log(f"Training perturbations: {train_pert}")
-    print_log(f"Test perturbations: {test_pert}")
-
-    overlap = train_pert & test_pert
-    if overlap:
-        print_log(f"WARNING: Found overlapping perturbations: {overlap}")
-        print_log("This violates the unseen perturbation assumption!")
-    else:
-        print_log(
-            "No overlapping perturbations - unseen perturbation setup confirmed")
-
 def load_model_for_analysis(model_path, device='cuda'):
     """Load a trained model for downstream analysis (DEGs, KEGG)"""
     print_log(f"Loading model from {model_path}")
@@ -1070,7 +1131,6 @@ def load_model_for_analysis(model_path, device='cuda'):
     scaler = checkpoint['scaler']
     model_config = checkpoint['model_config']
     evaluation_results = checkpoint['evaluation_results']
-    print_log("Detected ChemCPA-style checkpoint; skipping reconstruction and using saved predictions directly for analysis")
 
     class DummyModel:
         def __init__(self):
@@ -1232,8 +1292,6 @@ def main(gpu_id=None):
     train_adata = sc.read_h5ad(train_path)
     test_adata = sc.read_h5ad(test_path)
 
-    validate_data_consistency(train_adata, test_adata)
-
     print_log(f'Training data shape: {train_adata.shape}')
     print_log(f'Test data shape: {test_adata.shape}')
 
@@ -1334,9 +1392,14 @@ def main(gpu_id=None):
     max_pert_dim, all_pert_names = standardize_perturbation_encoding(
         train_dataset, test_dataset)
 
+    
+    n_genes = train_dataset.n_genes
+    print_log(f"Model input dim (PCA): 128, Model output dim (full genes): {n_genes}")
+
     best_params = study.best_params
     final_model = CondOTGRNModel(
         input_dim=128,
+        output_dim=n_genes,  
         pert_dim=max_pert_dim,
         dose_dim=1,
         latent_dim=best_params['latent_dim'],
@@ -1482,967 +1545,3 @@ if __name__ == '__main__':
 
     print_log("Training completed successfully!")
     print_log("=" * 80)
-
-import anndata
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from tqdm import tqdm
-import os
-import pandas as pd
-from sklearn.metrics import r2_score
-from scipy.stats import pearsonr
-import optuna
-import time
-from datetime import datetime
-import argparse
-import warnings
-warnings.filterwarnings('ignore')
-
-def print_log(message):
-    """Custom print function with timestamp"""
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
-
-train_adata = None
-test_adata = None
-train_dataset = None
-test_dataset = None
-device = None
-pca_model = None
-scaler = None
-
-class GeneExpressionDataset(Dataset):
-    """Dataset for single-cell perturbation prediction"""
-
-    def __init__(self, adata, perturbation_key='perturbation', dose_key='dose_value',
-                 scaler=None, pca_model=None, pca_dim=512, fit_pca=False,
-                 augment=False, is_train=True, common_genes_info=None,
-                 perturbation_mapping=None):
-        self.adata = adata
-        self.perturbation_key = perturbation_key
-        self.dose_key = dose_key
-        self.augment = augment
-        self.training = True
-        self.pca_dim = pca_dim
-        self.is_train = is_train
-        self.common_genes_info = common_genes_info
-        self.perturbation_mapping = perturbation_mapping
-
-        if common_genes_info is not None:
-            if is_train:
-                gene_idx = common_genes_info['train_idx']
-            else:
-                gene_idx = common_genes_info['test_idx']
-
-            if scipy.sparse.issparse(adata.X):
-                data = adata.X[:, gene_idx].toarray()
-            else:
-                data = adata.X[:, gene_idx]
-        else:
-            if scipy.sparse.issparse(adata.X):
-                data = adata.X.toarray()
-            else:
-                data = adata.X
-
-        data = np.maximum(data, 0)
-        data = np.maximum(data, 1e-10)
-        data = np.log1p(data)
-
-        if scaler is None:
-            self.scaler = StandardScaler()
-            data = self.scaler.fit_transform(data)
-        else:
-            self.scaler = scaler
-            data = self.scaler.transform(data)
-
-        data = np.clip(data, -10, 10)
-        data = data / 10.0
-
-        if pca_model is None:
-            if fit_pca:
-                self.pca = PCA(n_components=pca_dim)
-                self.expression_data = self.pca.fit_transform(data)
-            else:
-                raise ValueError('pca_model must be provided for test set')
-        else:
-            self.pca = pca_model
-            self.expression_data = self.pca.transform(data)
-
-        if perturbation_mapping is not None:
-            
-            pert_series = adata.obs[perturbation_key]
-            self.perturbations = np.zeros(
-                (len(pert_series), len(perturbation_mapping)))
-            for i, pert in enumerate(pert_series):
-                if pert in perturbation_mapping:
-                    self.perturbations[i, perturbation_mapping[pert]] = 1.0
-                else:
-                    
-                    self.perturbations[i, 0] = 1.0
-        else:
-            self.perturbations = pd.get_dummies(
-                adata.obs[perturbation_key]).values
-
-        print(
-            f"{'train' if is_train else 'test'} set perturbation dimension: {self.perturbations.shape[1]}")
-        print(
-            f"{'train' if is_train else 'test'} set perturbation types: {adata.obs[perturbation_key].unique()}")
-
-        self.perturbation_names = list(adata.obs[perturbation_key].unique())
-        
-        perturbation_labels = adata.obs[perturbation_key].astype(str).values
-        perturbation_labels = np.array(perturbation_labels, dtype='U')
-        lower_labels = np.char.lower(perturbation_labels)
-        negctrl_mask = np.char.find(lower_labels, 'negctrl') >= 0
-        control_mask = (lower_labels == 'control') | \
-            (lower_labels == 'ctrl') | negctrl_mask
-        self._control_indices = np.where(control_mask)[0]
-        self._non_control_indices = np.where(~control_mask)[0]
-        
-        self._pert_to_indices = {}
-        for pert_name in self.perturbation_names:
-            pert_mask = perturbation_labels == pert_name
-            pert_indices = np.where(pert_mask)[0]
-            
-            pert_indices = pert_indices[~np.isin(pert_indices, self._control_indices)]
-            if len(pert_indices) > 0:
-                self._pert_to_indices[pert_name] = pert_indices
-        
-        self._non_control_pert_names = [name for name in self.perturbation_names 
-                                        if name not in ['control', 'Control', 'ctrl', 'Ctrl'] 
-                                        and 'negctrl' not in name.lower()]
-
-        dose_values = adata.obs[dose_key].astype(str)
-        dose_values = dose_values.replace('', '0.0')
-        self.dose_values = pd.to_numeric(
-            dose_values, errors='coerce').fillna(0.0).values
-        self.dose_values = self.dose_values.reshape(-1, 1)
-
-        print(f"{'train' if is_train else 'test'} set dose range: {self.dose_values.min():.3f} - {self.dose_values.max():.3f}")
-
-    def __len__(self):
-        return len(self.adata)
-
-    def __getitem__(self, idx):
-        
-        x_baseline = self.expression_data[idx]
-        pert = self.perturbations[idx]
-        dose = self.dose_values[idx]
-
-        if idx in self._control_indices:
-            
-            if len(self._non_control_pert_names) > 0 and len(self._non_control_indices) > 0:
-                
-                pert_name = self._non_control_pert_names[idx % len(self._non_control_pert_names)]
-                
-                if pert_name in self._pert_to_indices and len(self._pert_to_indices[pert_name]) > 0:
-                    pert_indices = self._pert_to_indices[pert_name]
-                    
-                    target_idx = int(pert_indices[(idx // len(self._non_control_pert_names)) % len(pert_indices)])
-                    x_target = self.expression_data[target_idx]
-                    pert_target = self.perturbations[target_idx]
-                    dose_target = self.dose_values[target_idx]
-                else:
-                    
-                    target_idx = int(self._non_control_indices[idx % len(self._non_control_indices)])
-                    x_target = self.expression_data[target_idx]
-                    pert_target = self.perturbations[target_idx]
-                    dose_target = self.dose_values[target_idx]
-            else:
-                
-                alternative_controls = self._control_indices[self._control_indices != idx]
-                if len(alternative_controls) > 0:
-                    target_idx = int(alternative_controls[idx % len(alternative_controls)])
-                    x_target = self.expression_data[target_idx]
-                    pert_target = self.perturbations[target_idx]
-                    dose_target = self.dose_values[target_idx]
-                else:
-                    
-                    x_target = x_baseline
-                    pert_target = pert
-                    dose_target = dose
-        else:
-            
-            if len(self._control_indices) > 0:
-                baseline_idx = int(self._control_indices[idx % len(self._control_indices)])
-                x_baseline = self.expression_data[baseline_idx]
-            x_target = self.expression_data[idx]
-            pert_target = pert
-            dose_target = dose
-
-        if self.augment and self.training:
-            noise = np.random.normal(0, 0.05, x_baseline.shape)
-            x_baseline = x_baseline + noise
-
-            mask = np.random.random(x_baseline.shape) > 0.05
-            x_baseline = x_baseline * mask
-
-        return (torch.FloatTensor(x_baseline),
-                torch.FloatTensor(pert_target),
-                torch.FloatTensor(dose_target),
-                torch.FloatTensor(x_target))
-
-class GeneEncoder(nn.Module):
-    """Gene-level encoder for 4222 genes"""
-
-    def __init__(self, input_dim, hidden_dim=512, output_dim=512):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, x):
-        return self.encoder(x)
-
-class PathwayEncoder(nn.Module):
-    """Pathway-level encoder for 128 modules"""
-
-    def __init__(self, input_dim, hidden_dim=256, output_dim=256):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, x):
-        return self.encoder(x)
-
-class CellEncoder(nn.Module):
-    """Cell-level encoder for 5K HVGs"""
-
-    def __init__(self, input_dim, hidden_dim=128, output_dim=128):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, x):
-        return self.encoder(x)
-
-class ChemEncoder(nn.Module):
-    """Chemical compound encoder - simplified for perturbation prediction"""
-
-    def __init__(self, input_dim, hidden_dim=512, output_dim=512):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, pert_features):
-        return self.encoder(pert_features)
-
-class TargetEncoder(nn.Module):
-    """Drug target encoder using GNN over PPI network"""
-
-    def __init__(self, input_dim, hidden_dim=256, output_dim=256):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, target_features):
-        return self.encoder(target_features)
-
-class PathwayAnnotationEncoder(nn.Module):
-    """Pathway annotation encoder with hierarchical embeddings"""
-
-    def __init__(self, input_dim, hidden_dim=256, output_dim=256):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, pathway_features):
-        return self.encoder(pathway_features)
-
-class DosePD(nn.Module):
-    """Pharmacodynamics module with Hill function"""
-
-    def __init__(self, input_dim, hidden_dim=64, output_dim=64):
-        super().__init__()
-        self.hill_params = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 3)  
-        )
-        self.output_proj = nn.Linear(3, output_dim)
-
-    def forward(self, dose, chem_features):
-        
-        params = self.hill_params(chem_features)
-        emax = torch.sigmoid(params[:, 0])  
-        ec50 = torch.exp(params[:, 1])      
-        h = torch.exp(params[:, 2])         
-
-        dose_h = torch.pow(dose + 1e-8, h)
-        ec50_h = torch.pow(ec50, h)
-        effect = emax * dose_h / (ec50_h + dose_h)
-
-        return self.output_proj(params)
-
-class DiffusionNet(nn.Module):
-    """Diffusion network for denoising"""
-
-    def __init__(self, input_dim, hidden_dim, time_embed_dim=128, condition_dim=1024):
-        super().__init__()
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, time_embed_dim),
-            nn.GELU(),
-            nn.Linear(time_embed_dim, time_embed_dim)
-        )
-
-        total_input_dim = input_dim + time_embed_dim + condition_dim
-        self.net = nn.Sequential(
-            nn.Linear(total_input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, input_dim)
-        )
-
-    def forward(self, x, t, condition):
-        
-        t_embed = self.time_embed(t)
-
-        x_cond = torch.cat([x, t_embed, condition], dim=-1)
-
-        return self.net(x_cond)
-
-class MultiScaleDiffusion(nn.Module):
-    """Multi-scale conditional diffusion"""
-
-    def __init__(self, gene_dim=512, pathway_dim=256, cell_dim=128,
-                 condition_dim=1024, time_embed_dim=128):
-        super().__init__()
-
-        self.gene_diffusion = DiffusionNet(
-            gene_dim, 512, time_embed_dim, condition_dim)
-
-        self.pathway_diffusion = DiffusionNet(
-            pathway_dim, 256, time_embed_dim, condition_dim)
-
-        self.cell_diffusion = DiffusionNet(
-            cell_dim, 128, time_embed_dim, condition_dim)
-
-        self.condition_proj = nn.Linear(condition_dim, condition_dim)
-
-    def forward(self, z_gene, z_pathway, z_cell, t, condition):
-        
-        condition_proj = self.condition_proj(condition)
-
-        z_gene_pred = self.gene_diffusion(z_gene, t, condition_proj)
-        z_pathway_pred = self.pathway_diffusion(z_pathway, t, condition_proj)
-        z_cell_pred = self.cell_diffusion(z_cell, t, condition_proj)
-
-        return z_gene_pred, z_pathway_pred, z_cell_pred
-
-class GRNConstraint(nn.Module):
-    """Gene Regulatory Network constraint module"""
-
-    def __init__(self, input_dim, grn_dim=256):
-        super().__init__()
-        self.grn_net = nn.Sequential(
-            nn.Linear(input_dim, grn_dim),
-            nn.LayerNorm(grn_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(grn_dim, input_dim)
-        )
-
-    def forward(self, x, grn_adjacency=None):
-        return self.grn_net(x)
-
-class DEWeighting(nn.Module):
-    """Differentially Expressed gene weighting module"""
-
-    def __init__(self, input_dim, de_dim=256):
-        super().__init__()
-        self.de_net = nn.Sequential(
-            nn.Linear(input_dim, de_dim),
-            nn.LayerNorm(de_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(de_dim, input_dim),
-            nn.Sigmoid()  
-        )
-
-    def forward(self, x, de_annotations=None):
-        weights = self.de_net(x)
-        return x * weights
-
-class ChemCPAX(nn.Module):
-    """ChemCPA-X: Multi-scale Conditional Diffusion Model"""
-
-    def __init__(self, gene_dim=512, pathway_dim=256, cell_dim=128,
-                 pert_dim=4, dose_dim=1, condition_dim=1024,
-                 hidden_dim=512, n_layers=2, n_heads=8, dropout=0.1):
-        super().__init__()
-
-        self.gene_encoder = GeneEncoder(gene_dim, hidden_dim, gene_dim)
-        self.pathway_encoder = PathwayEncoder(
-            gene_dim, hidden_dim//2, pathway_dim)
-        self.cell_encoder = CellEncoder(gene_dim, hidden_dim//4, cell_dim)
-
-        self.chem_encoder = ChemEncoder(
-            input_dim=pert_dim + dose_dim, hidden_dim=512, output_dim=512)
-        self.target_encoder = TargetEncoder(
-            input_dim=pert_dim + dose_dim, hidden_dim=256, output_dim=256)
-        self.pathway_annotation_encoder = PathwayAnnotationEncoder(
-            input_dim=pert_dim + dose_dim, hidden_dim=256, output_dim=256)
-        self.dose_pd = DosePD(input_dim=pert_dim + dose_dim,
-                              hidden_dim=64, output_dim=64)
-
-        self.pert_embedding = nn.Linear(pert_dim, 128)
-
-        self.unseen_pert_embedding = nn.Embedding(
-            1, 128)  
-
-        self.cellline_embed = nn.Embedding(3, 128)  
-
-        actual_condition_dim = 512 + 256 + 256 + 64 + 128 + 128
-        self.diffusion = MultiScaleDiffusion(
-            gene_dim=gene_dim, pathway_dim=pathway_dim, cell_dim=cell_dim,
-            condition_dim=actual_condition_dim
-        )
-
-        fusion_dim = gene_dim + pathway_dim + cell_dim
-        
-        condition_dim = 512 + 256 + 256 + 64 + 128 + 128
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_dim, condition_dim),
-            nn.LayerNorm(condition_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-
-        self.grn_constraint = GRNConstraint(condition_dim)
-        self.de_weighting = DEWeighting(condition_dim)
-
-        self.decoder = nn.Sequential(
-            nn.Linear(condition_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, gene_dim)
-        )
-
-        self.perturbation_head = nn.Sequential(
-            nn.Linear(condition_dim, hidden_dim//2),
-            nn.LayerNorm(hidden_dim//2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, pert_dim)
-        )
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def forward(self, x_baseline, pert, dose, cellline_id=None, t=None, training=True):
-        
-        z_gene = self.gene_encoder(x_baseline)
-        z_pathway = self.pathway_encoder(x_baseline)
-        z_cell = self.cell_encoder(x_baseline)
-
-        chem_features = torch.cat([pert, dose], dim=-1)
-        h_chem = self.chem_encoder(chem_features)
-        h_targets = self.target_encoder(chem_features)
-        h_pathways = self.pathway_annotation_encoder(chem_features)
-        h_dose = self.dose_pd(dose, chem_features)
-
-        is_unseen = torch.all(pert[:, 1:] == 0, dim=1) & (pert[:, 0] == 1)
-        h_pert = self.pert_embedding(pert)
-
-        if torch.any(is_unseen):
-            unseen_embed = self.unseen_pert_embedding(
-                torch.zeros_like(is_unseen, dtype=torch.long))
-            h_pert = torch.where(is_unseen.unsqueeze(-1), unseen_embed, h_pert)
-
-        if cellline_id is None:
-            cellline_id = torch.zeros(x_baseline.size(
-                0), dtype=torch.long, device=x_baseline.device)
-        h_cellline = self.cellline_embed(cellline_id)
-
-        condition = torch.cat(
-            [h_chem, h_targets, h_pathways, h_dose, h_pert, h_cellline], dim=-1)
-
-        if training and t is not None:
-            
-            z_gene_pred, z_pathway_pred, z_cell_pred = self.diffusion(
-                z_gene, z_pathway, z_cell, t, condition
-            )
-        else:
-            
-            z_gene_pred, z_pathway_pred, z_cell_pred = z_gene, z_pathway, z_cell
-
-        z_fused = torch.cat([z_gene_pred, z_pathway_pred, z_cell_pred], dim=-1)
-        z_fused = self.fusion(z_fused)
-
-        z_constrained = self.grn_constraint(z_fused)
-        z_final = self.de_weighting(z_constrained)
-
-        output = self.decoder(z_final)
-        pert_pred = self.perturbation_head(z_final)
-
-        return output, pert_pred
-
-def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.1):
-    """Training function"""
-    model.train()
-    total_loss = 0
-    accumulation_steps = 4
-    optimizer.zero_grad()
-
-    for i, batch in enumerate(train_loader):
-        x_baseline, pert, dose, x_target = batch
-        x_baseline = x_baseline.to(device)
-        pert = pert.to(device)
-        dose = dose.to(device)
-        x_target = x_target.to(device)
-
-        t = torch.rand(x_baseline.size(0), 1, device=device)
-
-        output, pert_pred = model(x_baseline, pert, dose, t=t, training=True)
-
-        main_loss = F.mse_loss(output, x_target)
-        aux_loss = F.mse_loss(pert_pred, pert)
-        loss = main_loss + aux_weight * aux_loss
-
-        l2_reg = 0.0
-        for param in model.parameters():
-            l2_reg += torch.norm(param)
-        loss = loss + 1e-5 * l2_reg
-
-        loss = loss / accumulation_steps
-        loss.backward()
-
-        if (i + 1) % accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-        total_loss += loss.item() * accumulation_steps
-
-    return total_loss / len(train_loader)
-
-def evaluate_model(model, test_loader, device, aux_weight=0.1):
-    """Evaluation function"""
-    model.eval()
-    total_loss = 0
-    total_r2 = 0
-    total_pearson = 0
-    total_pert_r2 = 0
-
-    with torch.no_grad():
-        for batch in test_loader:
-            x_baseline, pert, dose, x_target = batch
-            x_baseline = x_baseline.to(device)
-            pert = pert.to(device)
-            dose = dose.to(device)
-            x_target = x_target.to(device)
-
-            output, pert_pred = model(x_baseline, pert, dose, training=False)
-
-            main_loss = F.mse_loss(output, x_target)
-            aux_loss = F.mse_loss(pert_pred, pert)
-            loss = main_loss + aux_weight * aux_loss
-
-            total_loss += loss.item()
-
-            r2 = r2_score(x_target.cpu().numpy(), output.cpu().numpy())
-            total_r2 += r2
-
-            pearson = np.mean([pearsonr(x_target[i].cpu().numpy(), output[i].cpu().numpy())[0]
-                               for i in range(x_target.size(0))])
-            total_pearson += pearson
-
-            pert_r2 = r2_score(pert.cpu().numpy(), pert_pred.cpu().numpy())
-            total_pert_r2 += pert_r2
-
-    return {
-        'loss': total_loss / len(test_loader),
-        'r2': total_r2 / len(test_loader),
-        'pearson': total_pearson / len(test_loader),
-        'pert_r2': total_pert_r2 / len(test_loader)
-    }
-
-def calculate_metrics(pred, true):
-    """Calculate 6 evaluation metrics"""
-    mse = np.mean((pred - true) ** 2)
-    pcc = np.mean([pearsonr(p, t)[0] for p, t in zip(pred.T, true.T)])
-    r2 = np.mean([r2_score(t, p) for p, t in zip(pred.T, true.T)])
-
-    std = np.std(true, axis=0)
-    de_mask = np.abs(true - np.mean(true, axis=0)) > std
-    if np.any(de_mask):
-        mse_de = np.mean((pred[de_mask] - true[de_mask]) ** 2)
-        pcc_de = np.mean([pearsonr(p[m], t[m])[0]
-                         for p, t, m in zip(pred.T, true.T, de_mask.T)])
-        r2_de = np.mean([r2_score(t[m], p[m])
-                        for p, t, m in zip(pred.T, true.T, de_mask.T)])
-    else:
-        mse_de = pcc_de = r2_de = np.nan
-
-    return {
-        'MSE': mse,
-        'PCC': pcc,
-        'R2': r2,
-        'MSE_DE': mse_de,
-        'PCC_DE': pcc_de,
-        'R2_DE': r2_de
-    }
-
-def evaluate_and_save_model(model, test_loader, device, save_path,
-                            common_genes_info=None, pca_model=None, scaler=None):
-    """Evaluate model and save results"""
-    model.eval()
-    all_predictions = []
-    all_targets = []
-
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc='Evaluating'):
-            x_baseline, pert, dose, x_target = batch
-            x_baseline = x_baseline.to(device)
-            pert = pert.to(device)
-            dose = dose.to(device)
-            x_target = x_target.to(device)
-
-            output, _ = model(x_baseline, pert, dose, training=False)
-
-            all_predictions.append(output.cpu().numpy())
-            all_targets.append(x_target.cpu().numpy())
-
-    all_predictions = np.concatenate(all_predictions, axis=0)
-    all_targets = np.concatenate(all_targets, axis=0)
-
-    results = calculate_metrics(all_predictions, all_targets)
-
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'evaluation_results': results,
-        'predictions': all_predictions,
-        'targets': all_targets,
-        'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
-        'pca_model': pca_model,
-        'scaler': scaler,
-        'perturbation_mapping': getattr(common_genes_info, 'perturbation_mapping', None) if common_genes_info is not None else None,
-        'model_config': {
-            'gene_dim': 512,
-            'pathway_dim': 256,
-            'cell_dim': 128,
-            'pert_dim': 4,
-            'dose_dim': 1
-        }
-    }, save_path)
-
-    metrics_df = pd.DataFrame({
-        'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
-        'Value': [results['MSE'], results['PCC'], results['R2'],
-                  results['MSE_DE'], results['PCC_DE'], results['R2_DE']]
-    })
-
-    print("\nEvaluation Results:")
-    print(metrics_df.to_string(index=False,
-          float_format=lambda x: '{:.6f}'.format(x)))
-    print(f"\nModel and evaluation results saved to: {save_path}")
-
-    return results
-
-def main(gpu_id=None):
-    """Main training function"""
-    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print_log(f'ChemCPA-X Training started at: {timestamp}')
-
-    if torch.cuda.is_available():
-        gpu_count = torch.cuda.device_count()
-        print_log(f'Available GPUs: {gpu_count}')
-        for i in range(gpu_count):
-            print_log(f'GPU {i}: {torch.cuda.get_device_name(i)}')
-
-        if gpu_id is not None:
-            if gpu_id >= gpu_count:
-                print_log(f'Warning: GPU {gpu_id} not available, using GPU 0')
-                gpu_id = 0
-            device = torch.device(f'cuda:{gpu_id}')
-            print_log(f'Using GPU {gpu_id}: {device}')
-        else:
-            device = torch.device('cuda:0')
-            print_log(f'Using default GPU 0: {device}')
-    else:
-        device = torch.device('cpu')
-        print_log('CUDA not available, using CPU')
-
-    print_log('Loading data...')
-    train_path = "/data1/yzy/split_new/datasets/SrivatsanTrapnell2020_train.h5ad"
-    test_path = "/data1/yzy/split_new/datasets/SrivatsanTrapnell2020_test.h5ad"
-
-    if not os.path.exists(train_path) or not os.path.exists(test_path):
-        raise FileNotFoundError(
-            f"Data files not found: {train_path} or {test_path}")
-
-    train_adata = sc.read_h5ad(train_path)
-    test_adata = sc.read_h5ad(test_path)
-
-    print_log(f'Training data shape: {train_adata.shape}')
-    print_log(f'Test data shape: {test_adata.shape}')
-    print_log(
-        f'Training perturbations: {train_adata.obs["perturbation"].unique()}')
-    print_log(f'Test perturbations: {test_adata.obs["perturbation"].unique()}')
-
-    train_perts = train_adata.obs["perturbation"].unique()
-    test_perts = test_adata.obs["perturbation"].unique()
-    all_perts = list(set(list(train_perts) + list(test_perts)))
-    perturbation_mapping = {pert: i for i, pert in enumerate(all_perts)}
-    print_log(f'Perturbation mapping: {perturbation_mapping}')
-    print_log(f'Unseen perturbations: {set(test_perts) - set(train_perts)}')
-
-    print_log("Processing gene consistency...")
-    train_genes = set(train_adata.var_names)
-    test_genes = set(test_adata.var_names)
-    common_genes = list(train_genes & test_genes)
-    print_log(f"Common genes: {len(common_genes)}")
-
-    common_genes.sort()
-    train_gene_idx = [train_adata.var_names.get_loc(
-        gene) for gene in common_genes]
-    test_gene_idx = [test_adata.var_names.get_loc(
-        gene) for gene in common_genes]
-
-    pca_model = PCA(n_components=512)
-
-    if scipy.sparse.issparse(train_adata.X):
-        train_data = train_adata.X[:, train_gene_idx].toarray()
-    else:
-        train_data = train_adata.X[:, train_gene_idx]
-
-    train_data = np.maximum(train_data, 0)
-    train_data = np.maximum(train_data, 1e-10)
-    train_data = np.log1p(train_data)
-
-    scaler = StandardScaler()
-    train_data = scaler.fit_transform(train_data)
-    train_data = np.clip(train_data, -10, 10)
-    train_data = train_data / 10.0
-
-    pca_model.fit(train_data)
-
-    common_genes_info = {
-        'genes': common_genes,
-        'train_idx': train_gene_idx,
-        'test_idx': test_gene_idx,
-        'perturbation_mapping': perturbation_mapping
-    }
-
-    train_dataset = GeneExpressionDataset(
-        train_adata,
-        perturbation_key='perturbation',
-        dose_key='dose_value',
-        scaler=scaler,
-        pca_model=pca_model,
-        pca_dim=512,
-        fit_pca=False,
-        augment=True,
-        is_train=True,
-        common_genes_info=common_genes_info,
-        perturbation_mapping=perturbation_mapping
-    )
-
-    test_dataset = GeneExpressionDataset(
-        test_adata,
-        perturbation_key='perturbation',
-        dose_key='dose_value',
-        scaler=scaler,
-        pca_model=pca_model,
-        pca_dim=512,
-        fit_pca=False,
-        augment=False,
-        is_train=False,
-        common_genes_info=common_genes_info,
-        perturbation_mapping=perturbation_mapping
-    )
-
-    model = ChemCPAX(
-        gene_dim=512,
-        pathway_dim=256,
-        cell_dim=128,
-        
-        pert_dim=len(perturbation_mapping),
-        dose_dim=1,
-        hidden_dim=512,
-        n_layers=2,
-        n_heads=8,
-        dropout=0.1
-    ).to(device)
-
-    print_log(
-        f'Model created with {sum(p.numel() for p in model.parameters())} parameters')
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=64,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=128,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True
-    )
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-4,
-        weight_decay=1e-5
-    )
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=10,
-        T_mult=2,
-        eta_min=1e-6
-    )
-
-    print_log('Starting training...')
-    best_loss = float('inf')
-    best_model = None
-    max_epochs = 300  
-    patience = 30     
-    patience_counter = 0
-
-    for epoch in range(max_epochs):
-        train_loss = train_model(
-            model, train_loader, optimizer, scheduler, device, aux_weight=0.1)
-        eval_metrics = evaluate_model(
-            model, test_loader, device, aux_weight=0.1)
-
-        if (epoch + 1) % 10 == 0:
-            print_log(f'Epoch {epoch+1}/{max_epochs}:')
-            print_log(f'Training Loss: {train_loss:.4f}')
-            print_log(f'Test Loss: {eval_metrics["loss"]:.4f}')
-            print_log(f'R2 Score: {eval_metrics["r2"]:.4f}')
-            print_log(f'Pearson Correlation: {eval_metrics["pearson"]:.4f}')
-            print_log(f'Perturbation R2: {eval_metrics["pert_r2"]:.4f}')
-
-        if eval_metrics["loss"] < best_loss:
-            best_loss = eval_metrics["loss"]
-            best_model = model.state_dict()
-            patience_counter = 0
-
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': best_loss,
-                'metrics': eval_metrics
-            }, f'chemcpa_x_best_model_{timestamp}.pt')
-            print_log(f"Saved best model with loss: {best_loss:.4f}")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print_log(f'Early stopping at epoch {epoch+1}')
-                break
-
-    if best_model is not None:
-        model.load_state_dict(best_model)
-
-    print_log('Evaluating final model...')
-    results = evaluate_and_save_model(
-        model, test_loader, device,
-        f'chemcpa_x_final_model_{timestamp}.pt',
-        common_genes_info, pca_model, scaler
-    )
-
-    results_df = pd.DataFrame({
-        'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
-        'Value': [results['MSE'], results['PCC'], results['R2'],
-                  results['MSE_DE'], results['PCC_DE'], results['R2_DE']]
-    })
-
-    results_df.to_csv(
-        f'chemcpa_x_evaluation_results_{timestamp}.csv', index=False)
-
-    print_log("\nFinal Evaluation Results:")
-    print_log(results_df.to_string(
-        index=False, float_format=lambda x: '{:.6f}'.format(x)))
-
-    return results_df
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='ChemCPA-X Training')
-    parser.add_argument('--gpu', type=int, default=None,
-                        help='GPU ID to use (0-7)')
-    parser.add_argument('--list-gpus', action='store_true',
-                        help='List available GPUs and exit')
-
-    args = parser.parse_args()
-
-    if args.list_gpus:
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            print(f'Available GPUs: {gpu_count}')
-            for i in range(gpu_count):
-                print(f'GPU {i}: {torch.cuda.get_device_name(i)}')
-        else:
-            print('CUDA not available')
-        exit(0)
-
-    print("=" * 60)
-    print("ChemCPA-X: Multi-scale Conditional Diffusion")
-    print("=" * 60)
-
-    if args.gpu is not None:
-        print(f"Using GPU: {args.gpu}")
-    else:
-        print("Using default GPU settings")
-
-    results_df = main(gpu_id=args.gpu)

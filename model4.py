@@ -21,11 +21,9 @@ import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
-
 def print_log(message):
     """Custom print function to simulate notebook output style"""
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
-
 
 train_adata = None
 test_adata = None
@@ -34,7 +32,6 @@ test_dataset = None
 device = None
 pca_model = None
 scaler = None
-
 
 class CITERNADataset(Dataset):
     def __init__(self, adata, perturbation_key='perturbation', scaler=None, pca_model=None,
@@ -47,7 +44,6 @@ class CITERNADataset(Dataset):
         self.is_train = is_train
         self.common_genes_info = common_genes_info
 
-        
         if common_genes_info is not None:
             if is_train:
                 gene_idx = common_genes_info['train_idx']
@@ -64,12 +60,10 @@ class CITERNADataset(Dataset):
             else:
                 data = adata.X
 
-        
         data = np.maximum(data, 0)
         data = np.maximum(data, 1e-10)
         data = np.log1p(data)
 
-        
         if scaler is None:
             self.scaler = StandardScaler()
             data = self.scaler.fit_transform(data)
@@ -80,7 +74,9 @@ class CITERNADataset(Dataset):
         data = np.clip(data, -10, 10)
         data = data / 10.0
 
-        
+        self.original_expression_data = data.copy()
+        self.n_genes = data.shape[1]
+
         if pca_model is None:
             if fit_pca:
                 self.pca = PCA(n_components=pca_dim)
@@ -91,32 +87,27 @@ class CITERNADataset(Dataset):
             self.pca = pca_model
             self.expression_data = self.pca.transform(data)
 
-        
         self.perturbations = pd.get_dummies(adata.obs[perturbation_key]).values
         print(
             f"{'train' if is_train else 'test'} set perturbation dimension: {self.perturbations.shape[1]}")
 
-        
         self._create_baseline_perturbation_pairs()
 
     def _create_baseline_perturbation_pairs(self):
         """Create baseline and perturbed expression pairs to prevent data leakage"""
-        
+
         control_mask = self.adata.obs[self.perturbation_key] == 'control'
         control_indices = np.where(control_mask)[0]
 
-        
         perturbed_mask = ~control_mask
         perturbed_indices = np.where(perturbed_mask)[0]
 
         print(f"Control samples: {len(control_indices)}")
         print(f"Perturbed samples: {len(perturbed_indices)}")
 
-        
-        
         self.pairs = []
         for i, perturbed_idx in enumerate(perturbed_indices):
-            
+
             baseline_idx = np.random.choice(control_indices)
             self.pairs.append({
                 'baseline_idx': baseline_idx,
@@ -124,11 +115,9 @@ class CITERNADataset(Dataset):
                 'perturbation': self.perturbations[perturbed_idx]
             })
 
-        
-        
         for control_idx in control_indices:
             if len(perturbed_indices) > 0:
-                
+
                 target_idx = np.random.choice(perturbed_indices)
                 self.pairs.append({
                     'baseline_idx': control_idx,
@@ -136,7 +125,7 @@ class CITERNADataset(Dataset):
                     'perturbation': self.perturbations[target_idx]
                 })
             else:
-                
+
                 alternative_controls = control_indices[control_indices != control_idx]
                 if len(alternative_controls) > 0:
                     target_idx = np.random.choice(alternative_controls)
@@ -145,7 +134,6 @@ class CITERNADataset(Dataset):
                         'perturbed_idx': target_idx,
                         'perturbation': self.perturbations[target_idx]
                     })
-                
 
         print(f"Total pairs created: {len(self.pairs)}")
 
@@ -155,12 +143,11 @@ class CITERNADataset(Dataset):
     def __getitem__(self, idx):
         pair = self.pairs[idx]
 
-        
         baseline_expr = self.expression_data[pair['baseline_idx']]
-        perturbed_expr = self.expression_data[pair['perturbed_idx']]
+
+        perturbed_expr = self.original_expression_data[pair['perturbed_idx']]
         perturbation = pair['perturbation']
 
-        
         if self.augment and self.training:
             noise = np.random.normal(0, 0.05, baseline_expr.shape)
             baseline_expr = baseline_expr + noise
@@ -174,7 +161,6 @@ class CITERNADataset(Dataset):
         return (torch.FloatTensor(baseline_expr),
                 torch.FloatTensor(perturbation),
                 torch.FloatTensor(perturbed_expr))
-
 
 class PerturbationEmbedding(nn.Module):
     def __init__(self, pert_dim, emb_dim):
@@ -190,18 +176,17 @@ class PerturbationEmbedding(nn.Module):
         x = self.dropout(x)
         return x
 
-
 class CITERNATransformerModel(nn.Module):
-    def __init__(self, input_dim, pert_dim, hidden_dim=512, n_layers=3, n_heads=8,
+    def __init__(self, input_dim, output_dim, pert_dim, hidden_dim=512, n_layers=3, n_heads=8,
                  dropout=0.1, attention_dropout=0.1, ffn_dropout=0.1,
                  use_pert_emb=True, pert_emb_dim=64):
         super(CITERNATransformerModel, self).__init__()
         self.input_dim = input_dim
+        self.output_dim = output_dim
         self.pert_dim = pert_dim
         self.hidden_dim = hidden_dim
         self.use_pert_emb = use_pert_emb
 
-        
         self.expression_encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -213,7 +198,6 @@ class CITERNATransformerModel(nn.Module):
             nn.Dropout(dropout)
         )
 
-        
         if use_pert_emb:
             self.pert_encoder = PerturbationEmbedding(pert_dim, pert_emb_dim)
             pert_out_dim = pert_emb_dim
@@ -226,7 +210,6 @@ class CITERNATransformerModel(nn.Module):
             )
             pert_out_dim = hidden_dim
 
-        
         fusion_dim = hidden_dim + pert_out_dim
         self.fusion_dim = ((fusion_dim + n_heads - 1) // n_heads) * n_heads
         if self.fusion_dim != fusion_dim:
@@ -234,8 +217,6 @@ class CITERNATransformerModel(nn.Module):
         else:
             self.fusion_proj = nn.Identity()
 
-        
-        
         mlp_layers = []
         for _ in range(n_layers):
             mlp_layers.extend([
@@ -246,7 +227,6 @@ class CITERNATransformerModel(nn.Module):
             ])
         self.mlp = nn.Sequential(*mlp_layers) if mlp_layers else nn.Identity()
 
-        
         self.fusion = nn.Sequential(
             nn.Linear(self.fusion_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -259,10 +239,9 @@ class CITERNATransformerModel(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, input_dim)
+            nn.Linear(hidden_dim, output_dim)
         )
 
-        
         self.perturbation_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim//2),
             nn.LayerNorm(hidden_dim//2),
@@ -283,26 +262,21 @@ class CITERNATransformerModel(nn.Module):
             nn.init.zeros_(module.bias)
 
     def forward(self, baseline_expr, pert):
-        
+
         expr_feat = self.expression_encoder(baseline_expr)
 
-        
         pert_feat = self.pert_encoder(pert)
 
-        
         fusion_input = torch.cat([expr_feat, pert_feat], dim=1)
         fusion_input = self.fusion_proj(fusion_input)
-        
-        
+
         x_trans = self.mlp(fusion_input)
 
-        
         fused = self.fusion(x_trans)
-        output = self.output(fused)  
+        output = self.output(fused)
         pert_pred = self.perturbation_head(fused)
 
         return output, pert_pred
-
 
 def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.1):
     model.train()
@@ -315,20 +289,8 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
         baseline_expr, pert, target_expr = baseline_expr.to(
             device), pert.to(device), target_expr.to(device)
 
-        
-        
-        diff = (baseline_expr - target_expr).pow(2).mean(dim=1)
-        valid_mask = diff > 1e-6
-        if not torch.any(valid_mask):
-            continue
-        baseline_expr = baseline_expr[valid_mask]
-        pert = pert[valid_mask]
-        target_expr = target_expr[valid_mask]
-
-        
         output, pert_pred = model(baseline_expr, pert)
 
-        
         main_loss = F.mse_loss(output, target_expr)
         aux_loss = F.mse_loss(pert_pred, pert)
         loss = main_loss + aux_weight * aux_loss
@@ -336,7 +298,6 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
         loss = loss / accumulation_steps
         loss.backward()
 
-        
         if (i + 1) % accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -346,7 +307,6 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
         total_loss += loss.item() * accumulation_steps
 
     return total_loss / len(train_loader)
-
 
 def evaluate_model(model, test_loader, device, aux_weight=0.1):
     model.eval()
@@ -361,19 +321,8 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
             baseline_expr, pert, target_expr = baseline_expr.to(
                 device), pert.to(device), target_expr.to(device)
 
-            
-            
-            diff = (baseline_expr - target_expr).pow(2).mean(dim=1)
-            valid_mask = diff > 1e-6
-            if not torch.any(valid_mask):
-                continue
-            baseline_expr = baseline_expr[valid_mask]
-            pert = pert[valid_mask]
-            target_expr = target_expr[valid_mask]
-
             output, pert_pred = model(baseline_expr, pert)
 
-            
             main_loss = F.mse_loss(output, target_expr)
             aux_loss = F.mse_loss(pert_pred, pert)
             loss = main_loss + aux_weight * aux_loss
@@ -394,25 +343,22 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
         'pert_r2': total_pert_r2 / len(test_loader)
     }
 
-
 def calculate_metrics(pred, true, control_baseline=None):
     """
     Calculate 6 evaluation metrics strictly following paper definitions.
-    
+
     Args:
         pred: Predicted expression (n_samples, n_genes)
         true: True expression (n_samples, n_genes)
         control_baseline: Optional control baseline expression (n_control_samples, n_genes) for LFC calculation
-    
+
     Returns:
         dict with MSE, PCC, R2, MSE_DE, PCC_DE, R2_DE
     """
     n_samples, n_genes = true.shape
-    
-    
+
     mse = np.mean((pred - true) ** 2)
-    
-    
+
     pred_flat = pred.flatten()
     true_flat = true.flatten()
     if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
@@ -421,10 +367,8 @@ def calculate_metrics(pred, true, control_baseline=None):
             pcc = 0.0
     else:
         pcc = 0.0
-    
-    
-    
-    true_mean_overall = np.mean(true)  
+
+    true_mean_overall = np.mean(true)
     ss_res = np.sum((true - pred) ** 2)
     ss_tot = np.sum((true - true_mean_overall) ** 2)
     if ss_tot > 1e-10:
@@ -433,22 +377,21 @@ def calculate_metrics(pred, true, control_baseline=None):
         r2 = 0.0
     if np.isnan(r2):
         r2 = 0.0
-    
-    
+
     if control_baseline is not None and control_baseline.shape[0] > 0:
-        
+
         epsilon = 1e-8
         true_mean_pert = np.mean(true, axis=0)
         control_mean = np.mean(control_baseline, axis=0)
-        
+
         lfc = np.log2((true_mean_pert + epsilon) / (control_mean + epsilon))
         lfc_abs = np.abs(lfc)
-        
+
         K = min(20, n_genes)
         top_k_indices = np.argsort(lfc_abs)[-K:]
         de_mask = np.zeros(n_genes, dtype=bool)
         de_mask[top_k_indices] = True
-        
+
         if np.any(de_mask):
             mse_de = np.mean((pred[:, de_mask] - true[:, de_mask]) ** 2)
             pred_de_flat = pred[:, de_mask].flatten()
@@ -459,7 +402,7 @@ def calculate_metrics(pred, true, control_baseline=None):
                     pcc_de = 0.0
             else:
                 pcc_de = 0.0
-            true_de_mean_overall = np.mean(true[:, de_mask])  
+            true_de_mean_overall = np.mean(true[:, de_mask])
             ss_res_de = np.sum((true[:, de_mask] - pred[:, de_mask]) ** 2)
             ss_tot_de = np.sum((true[:, de_mask] - true_de_mean_overall) ** 2)
             if ss_tot_de > 1e-10:
@@ -471,7 +414,7 @@ def calculate_metrics(pred, true, control_baseline=None):
         else:
             mse_de = pcc_de = r2_de = np.nan
     else:
-        
+
         std = np.std(true, axis=0)
         de_mask = np.abs(true - np.mean(true, axis=0)) > std
         if np.any(de_mask):
@@ -505,7 +448,6 @@ def calculate_metrics(pred, true, control_baseline=None):
         'R2_DE': r2_de
     }
 
-
 def objective(trial, timestamp):
     global train_dataset, test_dataset, device, pca_model
 
@@ -525,9 +467,12 @@ def objective(trial, timestamp):
         'pert_emb_dim': trial.suggest_int('pert_emb_dim', 32, 128)
     }
 
-    
+    n_genes = train_dataset.n_genes
+    print(f"Model input dim (PCA): 128, Model output dim (full genes): {n_genes}")
+
     model = CITERNATransformerModel(
         input_dim=128,
+        output_dim=n_genes,
         pert_dim=train_dataset.perturbations.shape[1],
         hidden_dim=params['n_hidden'],
         n_layers=params['n_layers'],
@@ -539,7 +484,6 @@ def objective(trial, timestamp):
         pert_emb_dim=params['pert_emb_dim']
     ).to(device)
 
-    
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=params['learning_rate'],
@@ -550,7 +494,6 @@ def objective(trial, timestamp):
         optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )
 
-    
     train_loader = DataLoader(
         train_dataset,
         batch_size=params['batch_size'],
@@ -567,14 +510,13 @@ def objective(trial, timestamp):
         pin_memory=True
     )
 
-    
     best_val_loss = float('inf')
     patience = 15
     patience_counter = 0
     max_epochs = 150
 
     for epoch in range(max_epochs):
-        
+
         model.train()
         train_loss = 0
         for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{max_epochs}'):
@@ -596,7 +538,6 @@ def objective(trial, timestamp):
 
         train_loss /= len(train_loader)
 
-        
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -616,7 +557,6 @@ def objective(trial, timestamp):
         val_loss /= len(test_loader)
         scheduler.step()
 
-        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -633,7 +573,6 @@ def objective(trial, timestamp):
                 f'Epoch {epoch+1}/{max_epochs} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f}')
 
     return best_val_loss
-
 
 def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None):
     """Evaluate model and save results"""
@@ -653,23 +592,20 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
             all_targets.append(target_expr.cpu().numpy())
             all_baselines.append(baseline_expr.cpu().numpy())
 
-    
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
     all_baselines = np.concatenate(all_baselines, axis=0)
 
-    
     control_baseline = all_baselines
-    
+
     results = calculate_metrics(all_predictions, all_targets, control_baseline=control_baseline)
 
-    
     torch.save({
         'model_state_dict': model.state_dict(),
         'evaluation_results': results,
-        'predictions': all_predictions,  
-        'targets': all_targets,  
-        'baselines': all_baselines,  
+        'predictions': all_predictions,
+        'targets': all_targets,
+        'baselines': all_baselines,
         'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
         'pca_model': pca_model,
         'scaler': scaler,
@@ -684,7 +620,6 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
         }
     }, save_path)
 
-    
     metrics_df = pd.DataFrame({
         'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
         'Value': [results['MSE'], results['PCC'], results['R2'],
@@ -698,15 +633,12 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
 
     return results
 
-
 def main(gpu_id=None):
     global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler
 
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f'RNA Model Training started at: {timestamp}')
 
-    
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         print(f'Available GPUs: {gpu_count}')
@@ -724,7 +656,6 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print('CUDA not available, using CPU')
 
-    
     print('Loading CITE-seq RNA data...')
     train_path = "/datasets/PapalexiSatija2021_eccite_RNA_train.h5ad"
     test_path = "/datasets/PapalexiSatija2021_eccite_RNA_test.h5ad"
@@ -739,7 +670,6 @@ def main(gpu_id=None):
     print(f'Training data shape: {train_adata.shape}')
     print(f'Test data shape: {test_adata.shape}')
 
-    
     print("Processing gene consistency...")
     train_genes = set(train_adata.var_names)
     test_genes = set(test_adata.var_names)
@@ -754,10 +684,8 @@ def main(gpu_id=None):
     test_gene_idx = [test_adata.var_names.get_loc(
         gene) for gene in common_genes]
 
-    
     pca_model = PCA(n_components=128)
 
-    
     if scipy.sparse.issparse(train_adata.X):
         train_data = train_adata.X[:, train_gene_idx].toarray()
     else:
@@ -774,14 +702,12 @@ def main(gpu_id=None):
 
     pca_model.fit(train_data)
 
-    
     common_genes_info = {
         'genes': common_genes,
         'train_idx': train_gene_idx,
         'test_idx': test_gene_idx
     }
 
-    
     train_dataset = CITERNADataset(
         train_adata,
         perturbation_key='perturbation',
@@ -806,7 +732,6 @@ def main(gpu_id=None):
         common_genes_info=common_genes_info
     )
 
-    
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42),
@@ -824,10 +749,14 @@ def main(gpu_id=None):
     for key, value in study.best_params.items():
         print(f'{key}: {value}')
 
-    
     best_params = study.best_params
+
+    n_genes = train_dataset.n_genes
+    print(f"Model input dim (PCA): 128, Model output dim (full genes): {n_genes}")
+
     final_model = CITERNATransformerModel(
         input_dim=128,
+        output_dim=n_genes,
         pert_dim=train_dataset.perturbations.shape[1],
         hidden_dim=best_params['n_hidden'],
         n_layers=best_params['n_layers'],
@@ -839,7 +768,6 @@ def main(gpu_id=None):
         pert_emb_dim=best_params['pert_emb_dim']
     ).to(device)
 
-    
     train_loader = DataLoader(
         train_dataset,
         batch_size=best_params['batch_size'],
@@ -899,7 +827,6 @@ def main(gpu_id=None):
             }, f'cite_rna_best_model_{timestamp}.pt')
             print(f"Saved best RNA model with loss: {best_loss:.4f}")
 
-    
     final_model.load_state_dict(best_model)
 
     print('Evaluating final RNA model...')
@@ -907,7 +834,6 @@ def main(gpu_id=None):
                                       f'cite_rna_final_model_{timestamp}.pt',
                                       common_genes_info, pca_model, scaler)
 
-    
     results_df = pd.DataFrame({
         'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
         'Value': [results['MSE'], results['PCC'], results['R2'],
@@ -922,7 +848,6 @@ def main(gpu_id=None):
     display(results_df)
 
     return results_df
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='CITE-seq RNA Model Training')
