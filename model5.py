@@ -831,7 +831,7 @@ def objective(trial, timestamp):
             optimizer.zero_grad()
 
             pred_noise, pert_pred, noise, t = model(
-                x_target, pert, is_train=True)
+                x_baseline, pert, is_train=True)
 
             diffusion_loss = F.mse_loss(pred_noise, noise)
 
