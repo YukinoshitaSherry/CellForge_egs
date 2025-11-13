@@ -28,7 +28,6 @@ def print_log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
 
 
-# Global variables
 train_adata = None
 train_dataset = None
 test_dataset = None
@@ -48,7 +47,7 @@ class ATACDataset(Dataset):
         self.is_train = is_train
         self.common_genes_info = common_genes_info
 
-        # Data preprocessing - use common genes
+        
         if common_genes_info is not None:
             if is_train:
                 gene_idx = common_genes_info['train_idx']
@@ -65,12 +64,12 @@ class ATACDataset(Dataset):
             else:
                 data = adata.X
 
-        # ATAC-specific preprocessing
+        
         data = np.maximum(data, 0)
         data = np.maximum(data, 1e-10)
         data = np.log1p(data)
 
-        # Use the provided scaler or create a new one
+        
         if scaler is None:
             self.scaler = StandardScaler()
             data = self.scaler.fit_transform(data)
@@ -81,7 +80,7 @@ class ATACDataset(Dataset):
         data = np.clip(data, -10, 10)
         data = data / 10.0
 
-        # PCA Dimension Reduction
+        
         if pca_model is None:
             if fit_pca:
                 self.pca = PCA(n_components=pca_dim)
@@ -92,53 +91,103 @@ class ATACDataset(Dataset):
             self.pca = pca_model
             self.expression_data = self.pca.transform(data)
 
-        # Perturbation One-hot
+        
         self.perturbations = pd.get_dummies(adata.obs[perturbation_key]).values
         print(
             f"{'train' if is_train else 'test'} set perturbation dimension: {self.perturbations.shape[1]}")
+        
+        
+        self.perturbation_names = list(adata.obs[perturbation_key].unique())
+        
+        
+        perturbation_labels = adata.obs[perturbation_key].astype(str).values
+        perturbation_labels = np.array(perturbation_labels, dtype='U')
+        lower_labels = np.char.lower(perturbation_labels)
+        negctrl_mask = np.char.find(lower_labels, 'negctrl') >= 0
+        control_mask = (lower_labels == 'control') | \
+            (lower_labels == 'ctrl') | negctrl_mask
+        control_indices = np.where(control_mask)[0]
+        non_control_indices = np.where(~control_mask)[0]
+        
+        self._pert_to_indices = {}
+        for pert_name in self.perturbation_names:
+            pert_mask = perturbation_labels == pert_name
+            pert_indices = np.where(pert_mask)[0]
+            
+            pert_indices = pert_indices[~np.isin(pert_indices, control_indices)]
+            if len(pert_indices) > 0:
+                self._pert_to_indices[pert_name] = pert_indices
+        
+        
+        self._non_control_pert_names = [name for name in self.perturbation_names 
+                                        if name not in ['control', 'Control', 'ctrl', 'Ctrl'] 
+                                        and 'negctrl' not in name.lower()]
+        
+        
+        self._control_indices = control_indices
+        self._non_control_indices = non_control_indices
 
     def __len__(self):
         return len(self.adata)
 
     def __getitem__(self, idx):
-        # Retrieve the current sample
+        
+        
+        
+        
+        
         x_baseline = self.expression_data[idx]
         pert = self.perturbations[idx]
 
-        # For perturbation prediction, create baseline-target pairs
-        if np.argmax(pert) == 0:  # control condition
-            # If the condition is control, randomly select a non-control perturbation as the target
-            non_control_indices = np.where(
-                np.argmax(self.perturbations, axis=1) != 0)[0]
-            if len(non_control_indices) > 0:
-                target_idx = np.random.choice(non_control_indices)
-                x_target = self.expression_data[target_idx]
-                pert_target = self.perturbations[target_idx]
+        if idx in self._control_indices:
+            
+            
+            if len(self._non_control_pert_names) > 0 and len(self._non_control_indices) > 0:
+                
+                pert_name = self._non_control_pert_names[idx % len(self._non_control_pert_names)]
+                
+                if pert_name in self._pert_to_indices and len(self._pert_to_indices[pert_name]) > 0:
+                    pert_indices = self._pert_to_indices[pert_name]                   
+                    target_idx = int(pert_indices[(idx // len(self._non_control_pert_names)) % len(pert_indices)])
+                    x_target = self.expression_data[target_idx]
+                    pert_target = self.perturbations[target_idx]
+                else:
+                    
+                    target_idx = int(self._non_control_indices[idx % len(self._non_control_indices)])
+                    x_target = self.expression_data[target_idx]
+                    pert_target = self.perturbations[target_idx]
             else:
-                x_target = x_baseline
-                pert_target = pert
+                
+                alternative_controls = self._control_indices[self._control_indices != idx]
+                if len(alternative_controls) > 0:
+                    target_idx = int(alternative_controls[idx % len(alternative_controls)])
+                    x_target = self.expression_data[target_idx]
+                    pert_target = self.perturbations[target_idx]
+                else:
+                    
+                    x_target = x_baseline
+                    pert_target = pert
         else:
-            # If the condition is a perturbation, use a control sample as the baseline
-            control_indices = np.where(
-                np.argmax(self.perturbations, axis=1) == 0)[0]
-            if len(control_indices) > 0:
-                baseline_idx = np.random.choice(control_indices)
+            
+            
+            if len(self._control_indices) > 0:
+                baseline_idx = int(self._control_indices[idx % len(self._control_indices)])
                 x_baseline = self.expression_data[baseline_idx]
             x_target = self.expression_data[idx]
             pert_target = pert
 
         if self.augment and self.training:
-            # Add noise to the baseline sample
+            
             noise = np.random.normal(0, 0.05, x_baseline.shape)
             x_baseline = x_baseline + noise
 
-            # Apply random masking
+            
             mask = np.random.random(x_baseline.shape) > 0.05
             x_baseline = x_baseline * mask
 
         return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor(x_target)
 
-# Diffusion Model Components
+
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -155,9 +204,9 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
 
-        # Ensure the output dimension is correct
+        
         if embeddings.shape[-1] != self.dim:
-            # Pad or truncate when the dimension does not match
+            
             if embeddings.shape[-1] < self.dim:
                 padding = torch.zeros(
                     embeddings.shape[0], self.dim - embeddings.shape[-1], device=device)
@@ -203,22 +252,22 @@ class ConditionalDiffusionTransformer(nn.Module):
         self.input_dim = input_dim
         self.train_pert_dim = train_pert_dim
         self.test_pert_dim = test_pert_dim
-        # Ensure hidden_dim is divisible by n_heads
+        
         self.hidden_dim = ((hidden_dim + n_heads - 1) // n_heads) * n_heads
         self.diffusion_steps = diffusion_steps
         self.time_emb_dim = time_emb_dim
 
-        # Time embedding
+        
         self.time_embeddings = SinusoidalPositionEmbeddings(time_emb_dim)
         self.time_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.GELU()
         )
 
-        # Input projection
+        
         self.input_proj = nn.Linear(input_dim, self.hidden_dim)
 
-        # Perturbation embedding
+        
         self.train_pert_encoder = nn.Sequential(
             nn.Linear(train_pert_dim, pert_emb_dim),
             nn.LayerNorm(pert_emb_dim),
@@ -232,24 +281,23 @@ class ConditionalDiffusionTransformer(nn.Module):
             nn.Dropout(dropout)
         )
 
-        # Conditional embedding projection
+        
         self.cond_proj = nn.Linear(
             pert_emb_dim + time_emb_dim, self.hidden_dim)
 
-        # Transformer layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=self.hidden_dim * 4,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=n_layers)
+        
+        
+        mlp_layers = []
+        for _ in range(n_layers):
+            mlp_layers.extend([
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ])
+        self.mlp = nn.Sequential(*mlp_layers) if mlp_layers else nn.Identity()
 
-        # Output projection
+        
         self.output_proj = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
@@ -258,22 +306,24 @@ class ConditionalDiffusionTransformer(nn.Module):
             nn.Linear(self.hidden_dim, input_dim)
         )
 
-        # Multi-task heads
-        self.train_perturbation_head = nn.Sequential(
+        
+        
+        self.pert_head_shared = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim//2),
             nn.LayerNorm(self.hidden_dim//2),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.hidden_dim//2, train_pert_dim)
+            nn.Dropout(dropout)
         )
-
-        self.test_perturbation_head = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim//2),
-            nn.LayerNorm(self.hidden_dim//2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.hidden_dim//2, test_pert_dim)
-        )
+        
+        
+        self.train_perturbation_head = nn.Linear(self.hidden_dim//2, train_pert_dim)
+        self.test_perturbation_head = nn.Linear(self.hidden_dim//2, test_pert_dim)
+        
+        
+        if train_pert_dim == test_pert_dim:
+            
+            self.test_perturbation_head.weight.data = self.train_perturbation_head.weight.data.clone()
+            self.test_perturbation_head.bias.data = self.train_perturbation_head.bias.data.clone()
 
         self.apply(self._init_weights)
 
@@ -286,41 +336,73 @@ class ConditionalDiffusionTransformer(nn.Module):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
-    def forward(self, x, pert, timestep, is_train=True):
+    def forward(self, x, pert, timestep, is_train=True, force_use_test_encoder=False):
         batch_size = x.shape[0]
 
-        # Time embedding
+        
         time_emb = self.time_embeddings(timestep)
         time_emb = self.time_mlp(time_emb)
 
-        # Perturbation embedding
-        if is_train:
+        
+        
+        
+        if is_train and force_use_test_encoder and self.train_pert_dim != self.test_pert_dim:
+            
+            if pert.shape[1] == self.train_pert_dim:
+                
+                if self.test_pert_dim > self.train_pert_dim:
+                    
+                    pad_size = self.test_pert_dim - self.train_pert_dim
+                    pert_adapted = F.pad(pert, (0, pad_size), mode='constant', value=0)
+                else:
+                    
+                    pert_adapted = pert[:, :self.test_pert_dim]
+                pert_emb = self.test_pert_encoder(pert_adapted)
+            else:
+                
+                pert_emb = self.test_pert_encoder(pert)
+        elif is_train:
             pert_emb = self.train_pert_encoder(pert)
         else:
             pert_emb = self.test_pert_encoder(pert)
 
-        # Combine perturbation and time embeddings
+        
         cond_emb = torch.cat([pert_emb, time_emb], dim=-1)
         cond_emb = self.cond_proj(cond_emb)
 
-        # Input projection
+        
         x_proj = self.input_proj(x)
 
-        # Add conditional information
-        x_cond = x_proj.unsqueeze(1) + cond_emb.unsqueeze(1)
+        
+        x_cond = x_proj + cond_emb
 
-        # Transformer processing
-        x_trans = self.transformer(x_cond)
+        
+        x_trans = self.mlp(x_cond)
 
-        # Output projection
-        output = self.output_proj(x_trans.squeeze(1))
+        
+        output = self.output_proj(x_trans)
 
-        # Perturbation prediction
+        
+        
+        
+        
+        
+        x_pert_feat = self.pert_head_shared(x_trans)
+        
         if is_train:
-            pert_pred = self.train_perturbation_head(x_trans.squeeze(1))
+            pert_pred = self.train_perturbation_head(x_pert_feat)
+            
+            
+            
+            if self.train_pert_dim != self.test_pert_dim:
+                
+                
+                
+                _ = self.test_perturbation_head(x_pert_feat)  
         else:
-            pert_pred = self.test_perturbation_head(x_trans.squeeze(1))
-
+            
+            pert_pred = self.test_perturbation_head(x_pert_feat)
+        
         return output, pert_pred
 
 
@@ -330,7 +412,7 @@ class DiffusionModel(nn.Module):
         self.model = model
         self.diffusion_steps = diffusion_steps
 
-        # Linear beta schedule - register as buffers so they move to the correct device automatically
+        
         self.register_buffer('betas', torch.linspace(
             beta_start, beta_end, diffusion_steps))
         self.register_buffer('alphas', 1.0 - self.betas)
@@ -355,12 +437,12 @@ class DiffusionModel(nn.Module):
             alpha_bar_t = self.alpha_bars[t].view(-1, 1)
             beta_t = self.betas[t].view(-1, 1)
 
-            # Predict x_0
+            
             pred_x_start = (x - torch.sqrt(1 - alpha_bar_t) *
                             pred_noise) / torch.sqrt(alpha_bar_t)
 
-            # Sample x_{t-1}
-            if t[0] > 0:  # Check the first element because t is a batch tensor
+            
+            if t[0] > 0:  
                 noise = torch.randn_like(x)
                 mean = (pred_x_start * torch.sqrt(alpha_bar_t) +
                         x * torch.sqrt(1 - alpha_bar_t)) / torch.sqrt(alpha_t)
@@ -380,51 +462,123 @@ class DiffusionModel(nn.Module):
 
         return x
 
-    def forward(self, x_start, pert, is_train=True):
+    def p_sample_loop_from_baseline(self, x_baseline, pert, is_train=True, noise_scale=0.1):
+        """
+        Generate samples starting from baseline (for perturbation prediction)
+        
+        Args:
+            x_baseline: Baseline expression to start from
+            pert: Perturbation condition
+            is_train: Whether in training mode
+            noise_scale: Scale of noise to add to baseline (smaller = closer to baseline)
+        
+        Returns:
+            Generated sample starting from baseline
+        """
+        device = next(self.parameters()).device
+        
+        
+        
+        x = x_baseline + noise_scale * torch.randn_like(x_baseline)
+        
+        
+        
+        start_t = self.diffusion_steps // 2
+        
+        for t in reversed(range(start_t)):
+            t_tensor = torch.full(
+                (x.shape[0],), t, device=device, dtype=torch.long)
+            x = self.p_sample(x, pert, t_tensor, is_train)
+        
+        return x
+
+    def forward(self, x_start, pert, is_train=True, force_use_test_encoder=False):
         """Training forward pass"""
         batch_size = x_start.shape[0]
         device = x_start.device
 
-        # Sample random timesteps
+        
         t = torch.randint(0, self.diffusion_steps,
                           (batch_size,), device=device)
 
-        # Sample noise
+        
         noise = torch.randn_like(x_start)
 
-        # Add noise to x_start
+        
         x_noisy = self.q_sample(x_start, t, noise)
 
-        # Predict noise
-        pred_noise, pert_pred = self.model(x_noisy, pert, t, is_train)
+        
+        pred_noise, pert_pred = self.model(x_noisy, pert, t, is_train, force_use_test_encoder=force_use_test_encoder)
 
         return pred_noise, pert_pred, noise, t
 
 
 def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.1):
+    """
+    Train the diffusion model for perturbation prediction.
+    
+    The model learns to predict the noise that transforms x_target back to x_baseline,
+    conditioned on the perturbation. This allows the model to learn the mapping
+    from baseline + perturbation -> target.
+    
+    FIXED: Now also trains test_pert_encoder during training to ensure it's not randomly initialized.
+    """
     model.train()
     total_loss = 0
     accumulation_steps = 4
     optimizer.zero_grad()
+    
+    
+    
+    force_test_encoder_interval = 10  
+    train_pert_dim = model.model.train_pert_dim
+    test_pert_dim = model.model.test_pert_dim
+    use_test_encoder = (train_pert_dim != test_pert_dim)
 
     for i, batch in enumerate(train_loader):
         x_baseline, pert, x_target = batch
         x_baseline, pert, x_target = x_baseline.to(
             device), pert.to(device), x_target.to(device)
 
-        # Forward pass through diffusion model
-        pred_noise, pert_pred, noise, t = model(x_target, pert, is_train=True)
+        
+        
+        diff = (x_baseline - x_target).pow(2).mean(dim=1)
+        valid_mask = diff > 1e-6
+        if not torch.any(valid_mask):
+            continue
+        x_baseline = x_baseline[valid_mask]
+        pert = pert[valid_mask]
+        x_target = x_target[valid_mask]
 
-        # Calculate losses
+        
+        
+        force_use_test = use_test_encoder and (i % force_test_encoder_interval == 0)
+        
+        
+        
+        
+        
+        
+        
+        pred_noise, pert_pred, noise, t = model(x_target, pert, is_train=True, force_use_test_encoder=force_use_test)
+
+        
         diffusion_loss = F.mse_loss(pred_noise, noise)
-        aux_loss = F.mse_loss(pert_pred, pert)
+        
+        
+        
+        if pert_pred.shape[1] == pert.shape[1]:
+            aux_loss = F.mse_loss(pert_pred, pert)
+        else:
+            
+            aux_loss = torch.tensor(0.0, device=device)
         loss = diffusion_loss + aux_weight * aux_loss
         loss = loss / accumulation_steps
 
-        # Backward pass
+        
         loss.backward()
 
-        # Gradient accumulation
+        
         if (i + 1) % accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -437,6 +591,12 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
 
 
 def evaluate_model(model, test_loader, device, aux_weight=0.1):
+    """
+    Evaluate the model for perturbation prediction.
+    
+    CRITICAL FIX: Generate predictions starting from baseline, not from random noise.
+    This ensures the model performs true perturbation prediction: baseline + pert -> target.
+    """
     model.eval()
     total_loss = 0
     total_r2 = 0
@@ -449,15 +609,43 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
             x_baseline, pert, x_target = x_baseline.to(
                 device), pert.to(device), x_target.to(device)
 
-            # Generate predictions using diffusion sampling
-            pred_x = model.p_sample_loop(x_target.shape, pert, is_train=False)
+            
+            
+            diff = (x_baseline - x_target).pow(2).mean(dim=1)
+            valid_mask = diff > 1e-6
+            if not torch.any(valid_mask):
+                continue
+            x_baseline = x_baseline[valid_mask]
+            pert = pert[valid_mask]
+            x_target = x_target[valid_mask]
 
-            # Also get perturbation prediction
-            _, pert_pred, _, _ = model(x_target, pert, is_train=False)
+            
+            
+            
+            pred_x = model.p_sample_loop_from_baseline(x_baseline, pert, is_train=False)
 
-            # Calculate losses
+            
+            
+            
+            
+            
+            pred_x_noisy = pred_x + 0.01 * torch.randn_like(pred_x)
+            t_dummy = torch.zeros(pred_x.shape[0], dtype=torch.long, device=device)
+            _, pert_pred = model.model(pred_x_noisy, pert, t_dummy, is_train=False)
+            
+            
+            
+
+            
             diffusion_loss = F.mse_loss(pred_x, x_target)
-            aux_loss = F.mse_loss(pert_pred, pert)
+            
+            
+            if pert_pred.shape[1] == pert.shape[1]:
+                aux_loss = F.mse_loss(pert_pred, pert)
+            else:
+                
+                
+                aux_loss = torch.tensor(0.0, device=device)
             loss = diffusion_loss + aux_weight * aux_loss
 
             total_loss += loss.item()
@@ -466,7 +654,11 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
             pearson = np.mean([pearsonr(x_target[i].cpu().numpy(), pred_x[i].cpu().numpy())[0]
                                for i in range(x_target.size(0))])
             total_pearson += pearson
-            pert_r2 = r2_score(pert.cpu().numpy(), pert_pred.cpu().numpy())
+            
+            if pert_pred.shape[1] == pert.shape[1]:
+                pert_r2 = r2_score(pert.cpu().numpy(), pert_pred.cpu().numpy())
+            else:
+                pert_r2 = 0.0  
             total_pert_r2 += pert_r2
 
     return {
@@ -477,23 +669,106 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
     }
 
 
-def calculate_metrics(pred, true):
-    """Calculate 6 evaluation metrics"""
+def calculate_metrics(pred, true, control_baseline=None):
+    """
+    Calculate 6 evaluation metrics strictly following paper definitions.
+    
+    Args:
+        pred: Predicted expression (n_samples, n_genes)
+        true: True expression (n_samples, n_genes)
+        control_baseline: Optional control baseline expression (n_control_samples, n_genes) for LFC calculation
+    
+    Returns:
+        dict with MSE, PCC, R2, MSE_DE, PCC_DE, R2_DE
+    """
+    n_samples, n_genes = true.shape
+    
+    
     mse = np.mean((pred - true) ** 2)
-    pcc = np.mean([pearsonr(p, t)[0] for p, t in zip(pred.T, true.T)])
-    r2 = np.mean([r2_score(t, p) for p, t in zip(pred.T, true.T)])
-
-    # Differentially expressed genes (DE)
-    std = np.std(true, axis=0)
-    de_mask = np.abs(true - np.mean(true, axis=0)) > std
-    if np.any(de_mask):
-        mse_de = np.mean((pred[de_mask] - true[de_mask]) ** 2)
-        pcc_de = np.mean([pearsonr(p[m], t[m])[0]
-                         for p, t, m in zip(pred.T, true.T, de_mask.T)])
-        r2_de = np.mean([r2_score(t[m], p[m])
-                        for p, t, m in zip(pred.T, true.T, de_mask.T)])
+    
+    
+    pred_flat = pred.flatten()
+    true_flat = true.flatten()
+    if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
+        pcc = pearsonr(true_flat, pred_flat)[0]
+        if np.isnan(pcc):
+            pcc = 0.0
     else:
-        mse_de = pcc_de = r2_de = np.nan
+        pcc = 0.0
+    
+    
+    
+    true_mean_overall = np.mean(true)  
+    ss_res = np.sum((true - pred) ** 2)
+    ss_tot = np.sum((true - true_mean_overall) ** 2)
+    if ss_tot > 1e-10:
+        r2 = 1.0 - (ss_res / ss_tot)
+    else:
+        r2 = 0.0
+    if np.isnan(r2):
+        r2 = 0.0
+    
+    
+    if control_baseline is not None and control_baseline.shape[0] > 0:
+        
+        epsilon = 1e-8
+        true_mean_pert = np.mean(true, axis=0)
+        control_mean = np.mean(control_baseline, axis=0)
+        
+        lfc = np.log2((true_mean_pert + epsilon) / (control_mean + epsilon))
+        lfc_abs = np.abs(lfc)
+        
+        K = min(20, n_genes)
+        top_k_indices = np.argsort(lfc_abs)[-K:]
+        de_mask = np.zeros(n_genes, dtype=bool)
+        de_mask[top_k_indices] = True
+        
+        if np.any(de_mask):
+            mse_de = np.mean((pred[:, de_mask] - true[:, de_mask]) ** 2)
+            pred_de_flat = pred[:, de_mask].flatten()
+            true_de_flat = true[:, de_mask].flatten()
+            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
+                if np.isnan(pcc_de):
+                    pcc_de = 0.0
+            else:
+                pcc_de = 0.0
+            true_de_mean_overall = np.mean(true[:, de_mask])  
+            ss_res_de = np.sum((true[:, de_mask] - pred[:, de_mask]) ** 2)
+            ss_tot_de = np.sum((true[:, de_mask] - true_de_mean_overall) ** 2)
+            if ss_tot_de > 1e-10:
+                r2_de = 1.0 - (ss_res_de / ss_tot_de)
+            else:
+                r2_de = 0.0
+            if np.isnan(r2_de):
+                r2_de = 0.0
+        else:
+            mse_de = pcc_de = r2_de = np.nan
+    else:
+        
+        std = np.std(true, axis=0)
+        de_mask = np.abs(true - np.mean(true, axis=0)) > std
+        if np.any(de_mask):
+            mse_de = np.mean((pred[de_mask] - true[de_mask]) ** 2)
+            pred_de_flat = pred[de_mask].flatten()
+            true_de_flat = true[de_mask].flatten()
+            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
+                if np.isnan(pcc_de):
+                    pcc_de = 0.0
+            else:
+                pcc_de = 0.0
+            true_de_mean = np.mean(true[de_mask])
+            ss_res_de = np.sum((pred[de_mask] - true[de_mask]) ** 2)
+            ss_tot_de = np.sum((true[de_mask] - true_de_mean) ** 2)
+            if ss_tot_de > 1e-10:
+                r2_de = 1.0 - (ss_res_de / ss_tot_de)
+            else:
+                r2_de = 0.0
+            if np.isnan(r2_de):
+                r2_de = 0.0
+        else:
+            mse_de = pcc_de = r2_de = np.nan
 
     return {
         'MSE': mse,
@@ -507,10 +782,16 @@ def calculate_metrics(pred, true):
 
 def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusion_best.pt',
                             common_genes_info=None, pca_model=None, scaler=None):
-    """Evaluate model and save results"""
+    """
+    Evaluate model and save results.
+    
+    CRITICAL FIX: Generate predictions starting from baseline, not from random noise.
+    This ensures true perturbation prediction: baseline + pert -> target.
+    """
     model.eval()
     all_predictions = []
     all_targets = []
+    all_baselines = []
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
@@ -518,25 +799,33 @@ def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusio
             x_baseline, pert, x_target = x_baseline.to(
                 device), pert.to(device), x_target.to(device)
 
-            # Generate predictions using diffusion sampling
-            pred_x = model.p_sample_loop(x_target.shape, pert, is_train=False)
+            
+            
+            
+            pred_x = model.p_sample_loop_from_baseline(x_baseline, pert, is_train=False)
 
             all_predictions.append(pred_x.cpu().numpy())
             all_targets.append(x_target.cpu().numpy())
+            all_baselines.append(x_baseline.cpu().numpy())
 
-    # Calculate overall metrics
+    
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
+    all_baselines = np.concatenate(all_baselines, axis=0)
 
-    # Calculate evaluation metrics
-    results = calculate_metrics(all_predictions, all_targets)
+    
+    control_baseline = all_baselines
+    
+    
+    results = calculate_metrics(all_predictions, all_targets, control_baseline=control_baseline)
 
-    # Save model and evaluation results
+    
     torch.save({
         'model_state_dict': model.state_dict(),
         'evaluation_results': results,
         'predictions': all_predictions,
         'targets': all_targets,
+        'baselines': all_baselines,  
         'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
         'pca_model': pca_model,
         'scaler': scaler,
@@ -552,7 +841,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusio
         }
     }, save_path)
 
-    # Create DataFrame to display results
+    
     metrics_df = pd.DataFrame({
         'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
         'Value': [results['MSE'], results['PCC'], results['R2'],
@@ -570,9 +859,9 @@ def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusio
 def objective(trial, timestamp):
     global train_dataset, test_dataset, device, pca_model
 
-    # Hyperparameter search space
+    
     params = {
-        'pca_dim': 128,  # Fixed PCA dimension
+        'pca_dim': 128,  
         'n_hidden': trial.suggest_int('n_hidden', 256, 1024),
         'n_layers': trial.suggest_int('n_layers', 2, 6),
         'n_heads': trial.suggest_int('n_heads', 4, 8),
@@ -586,7 +875,7 @@ def objective(trial, timestamp):
         'diffusion_steps': trial.suggest_categorical('diffusion_steps', [500, 1000, 2000])
     }
 
-    # Create model
+    
     base_model = ConditionalDiffusionTransformer(
         input_dim=128,
         train_pert_dim=train_dataset.perturbations.shape[1],
@@ -602,7 +891,7 @@ def objective(trial, timestamp):
     model = DiffusionModel(
         base_model, diffusion_steps=params['diffusion_steps']).to(device)
 
-    # Optimizer and scheduler
+    
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=params['learning_rate'],
@@ -616,7 +905,7 @@ def objective(trial, timestamp):
         eta_min=1e-6
     )
 
-    # Create data loaders
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=params['batch_size'],
@@ -633,14 +922,14 @@ def objective(trial, timestamp):
         pin_memory=True
     )
 
-    # Training loop
+    
     best_val_loss = float('inf')
     patience = 15
     patience_counter = 0
     max_epochs = 150
 
     for epoch in range(max_epochs):
-        # Training phase
+        
         model.train()
         train_loss = 0
         for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{max_epochs}'):
@@ -653,8 +942,10 @@ def objective(trial, timestamp):
             pred_noise, pert_pred, noise, t = model(
                 x_target, pert, is_train=True)
 
-            # Calculate loss
+            
             diffusion_loss = F.mse_loss(pred_noise, noise)
+            
+            
             pert_loss = F.mse_loss(pert_pred, pert)
             loss = diffusion_loss + params['aux_weight'] * pert_loss
 
@@ -665,11 +956,11 @@ def objective(trial, timestamp):
 
         train_loss /= len(train_loader)
 
-        # Validation phase
+        
         model.eval()
         val_loss = 0
         val_batches_processed = 0
-        max_val_batches = 50  # Limit validation batches for speed
+        max_val_batches = 50  
 
         with torch.no_grad():
             for batch in tqdm(test_loader, desc=f'Validation Epoch {epoch+1}', leave=False):
@@ -680,11 +971,22 @@ def objective(trial, timestamp):
                 x_baseline, pert, x_target = x_baseline.to(
                     device), pert.to(device), x_target.to(device)
 
-                pred_noise, pert_pred, noise, t = model(
-                    x_target, pert, is_train=False)
+                
+                
+                pred_x = model.p_sample_loop_from_baseline(x_baseline, pert, is_train=False)
+                
+                
+                pred_x_noisy = pred_x + 0.01 * torch.randn_like(pred_x)
+                t_dummy = torch.zeros(pred_x.shape[0], dtype=torch.long, device=device)
+                _, pert_pred = model.model(pred_x_noisy, pert, t_dummy, is_train=False)
 
-                diffusion_loss = F.mse_loss(pred_noise, noise)
-                pert_loss = F.mse_loss(pert_pred, pert)
+                
+                diffusion_loss = F.mse_loss(pred_x, x_target)
+                
+                if pert_pred.shape[1] == pert.shape[1]:
+                    pert_loss = F.mse_loss(pert_pred, pert)
+                else:
+                    pert_loss = torch.tensor(0.0, device=device)
                 loss = diffusion_loss + params['aux_weight'] * pert_loss
 
                 val_loss += loss.item()
@@ -693,7 +995,7 @@ def objective(trial, timestamp):
         val_loss /= val_batches_processed
         scheduler.step()
 
-        # Early stopping
+        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -714,11 +1016,11 @@ def objective(trial, timestamp):
 def main(gpu_id=None):
     global train_adata, train_dataset, test_dataset, device, pca_model
 
-    # Generate timestamp
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f'Training started at: {timestamp}')
 
-    # Set device and GPU configuration
+    
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         print(f'Available GPUs: {gpu_count}')
@@ -739,10 +1041,10 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print('CUDA not available, using CPU')
 
-    # Load data
+    
     print('Loading ATAC data...')
-    train_path = "/data1/yzy/split_new/ATAC/LiscovitchBrauerSanjana2021_train.h5ad"
-    test_path = "/data1/yzy/split_new/ATAC/LiscovitchBrauerSanjana2021_test.h5ad"
+    train_path = "/datasets/LiscovitchBrauerSanjana2021_train.h5ad"
+    test_path = "/datasets/LiscovitchBrauerSanjana2021_test.h5ad"
 
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
@@ -754,14 +1056,14 @@ def main(gpu_id=None):
     print(f'Train data shape: {train_adata.shape}')
     print(f'Test data shape: {test_adata.shape}')
 
-    # Validate data consistency
+    
     train_pert = set(train_adata.obs['perturbation'].unique())
     test_pert = set(test_adata.obs['perturbation'].unique())
 
     print(f"Number of perturbation types in training set: {len(train_pert)}")
     print(f"Number of perturbation types in test set: {len(test_pert)}")
 
-    # Ensure consistent gene sets
+    
     print("Processing gene set consistency...")
     train_genes = set(train_adata.var_names)
     test_genes = set(test_adata.var_names)
@@ -770,19 +1072,19 @@ def main(gpu_id=None):
     print(f"Test genes: {len(test_genes)}")
     print(f"Common genes: {len(common_genes)}")
 
-    # Sort common genes for consistency
+    
     common_genes.sort()
 
-    # Get common gene indices
+    
     train_gene_idx = [train_adata.var_names.get_loc(
         gene) for gene in common_genes]
     test_gene_idx = [test_adata.var_names.get_loc(
         gene) for gene in common_genes]
 
-    # Create PCA model
+    
     pca_model = PCA(n_components=128)
 
-    # Preprocess training data
+    
     if scipy.sparse.issparse(train_adata.X):
         train_data = train_adata.X[:, train_gene_idx].toarray()
     else:
@@ -792,23 +1094,23 @@ def main(gpu_id=None):
     train_data = np.maximum(train_data, 1e-10)
     train_data = np.log1p(train_data)
 
-    # Standardization
+    
     scaler = StandardScaler()
     train_data = scaler.fit_transform(train_data)
     train_data = np.clip(train_data, -10, 10)
     train_data = train_data / 10.0
 
-    # Fit PCA model
+    
     pca_model.fit(train_data)
 
-    # Save common genes info
+    
     common_genes_info = {
         'genes': common_genes,
         'train_idx': train_gene_idx,
         'test_idx': test_gene_idx
     }
 
-    # Create datasets
+    
     train_dataset = ATACDataset(
         train_adata,
         perturbation_key='perturbation',
@@ -833,7 +1135,7 @@ def main(gpu_id=None):
         common_genes_info=common_genes_info
     )
 
-    # Create Optuna study
+    
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42),
@@ -844,16 +1146,16 @@ def main(gpu_id=None):
         )
     )
 
-    # Run hyperparameter optimization
+    
     print('Starting hyperparameter optimization...')
     study.optimize(lambda trial: objective(trial, timestamp), n_trials=50)
 
-    # Print best parameters
+    
     print('Best parameters:')
     for key, value in study.best_params.items():
         print(f'{key}: {value}')
 
-    # Train final model with best parameters
+    
     best_params = study.best_params
     base_model = ConditionalDiffusionTransformer(
         input_dim=128,
@@ -870,7 +1172,7 @@ def main(gpu_id=None):
     final_model = DiffusionModel(
         base_model, diffusion_steps=best_params['diffusion_steps']).to(device)
 
-    # Create data loaders for final training
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=best_params['batch_size'],
@@ -887,7 +1189,7 @@ def main(gpu_id=None):
         pin_memory=True
     )
 
-    # Optimizer and scheduler for final training
+    
     optimizer = torch.optim.AdamW(
         final_model.parameters(),
         lr=best_params['learning_rate'],
@@ -901,11 +1203,11 @@ def main(gpu_id=None):
         eta_min=1e-6
     )
 
-    # Train final model
+    
     print('Training final model...')
     best_loss = float('inf')
     best_model = None
-    max_epochs = 300  # Train longer for better results
+    max_epochs = 300  
 
     for epoch in range(max_epochs):
         train_loss = train_model(final_model, train_loader, optimizer, scheduler, device,
@@ -936,16 +1238,16 @@ def main(gpu_id=None):
             }, f'atac_diffusion_best_model_{timestamp}.pt')
             print(f"Saved best model with loss: {best_loss:.4f}")
 
-    # Load best model for final evaluation
+    
     final_model.load_state_dict(best_model)
 
-    # Evaluate and save final results
+    
     print('Evaluating final model...')
     results = evaluate_and_save_model(final_model, test_loader, device,
                                       f'atac_diffusion_final_model_{timestamp}.pt',
                                       common_genes_info, pca_model, scaler)
 
-    # Create detailed results DataFrame
+    
     results_df = pd.DataFrame({
         'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
         'Value': [results['MSE'], results['PCC'], results['R2'],
@@ -953,11 +1255,11 @@ def main(gpu_id=None):
         'Best_Params': [str(best_params)] * 6
     })
 
-    # Save results to CSV
+    
     results_df.to_csv(
         f'atac_diffusion_evaluation_results_{timestamp}.csv', index=False)
 
-    # Display results
+    
     print("\nFinal Evaluation Results:")
     display(results_df)
 
@@ -977,11 +1279,11 @@ def load_model_for_prediction(model_path, device='cuda'):
     """
     print(f"Loading model from {model_path}")
 
-    # Load saved data
+    
     checkpoint = torch.load(
         model_path, map_location=device, weights_only=False)
 
-    # Extract information
+    
     model_state = checkpoint['model_state_dict']
     predictions = checkpoint['predictions']
     targets = checkpoint['targets']
@@ -991,7 +1293,7 @@ def load_model_for_prediction(model_path, device='cuda'):
     model_config = checkpoint['model_config']
     evaluation_results = checkpoint['evaluation_results']
 
-    # Rebuild model
+    
     base_model = ConditionalDiffusionTransformer(
         input_dim=model_config['input_dim'],
         train_pert_dim=model_config['train_pert_dim'],
@@ -1005,7 +1307,7 @@ def load_model_for_prediction(model_path, device='cuda'):
     model = DiffusionModel(
         base_model, diffusion_steps=model_config['diffusion_steps']).to(device)
 
-    # Load model weights
+    
     model.load_state_dict(model_state)
     model.eval()
 
@@ -1041,22 +1343,22 @@ def create_anndata_for_analysis(predictions, targets, gene_names, perturbation_i
     """
     import anndata as ad
 
-    # Create AnnData for predictions
+    
     pred_adata = ad.AnnData(X=predictions)
     pred_adata.var_names = gene_names
     pred_adata.var['feature_types'] = 'ATAC Peaks'
 
-    # Create AnnData for targets
+    
     target_adata = ad.AnnData(X=targets)
     target_adata.var_names = gene_names
     target_adata.var['feature_types'] = 'ATAC Peaks'
 
-    # Add perturbation information if available
+    
     if perturbation_info is not None:
         pred_adata.obs['perturbation'] = perturbation_info
         target_adata.obs['perturbation'] = perturbation_info
 
-    # Add sample identifiers
+    
     pred_adata.obs['sample_type'] = 'predicted'
     target_adata.obs['sample_type'] = 'observed'
 
@@ -1068,7 +1370,7 @@ def create_anndata_for_analysis(predictions, targets, gene_names, perturbation_i
 
 
 if __name__ == '__main__':
-    # Parse command line arguments
+    
     parser = argparse.ArgumentParser(
         description='ATAC Conditional Diffusion Transformer Model Training')
     parser.add_argument('--gpu', type=int, default=None,
@@ -1078,7 +1380,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # If just listing GPUs, show info and exit
+    
     if args.list_gpus:
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
@@ -1089,7 +1391,7 @@ if __name__ == '__main__':
             print('CUDA not available')
         exit(0)
 
-    # Start training
+    
     print("=" * 60)
     print("ATAC Conditional Diffusion Transformer Model Training")
     print("=" * 60)
