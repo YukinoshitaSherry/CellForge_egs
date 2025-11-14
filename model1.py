@@ -428,6 +428,11 @@ def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_per
                     return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
         test_pert_names = test_dataset.perturbation_names
     elif test_perturbation_names is not None:
+        if hasattr(train_dataset, '_pert_encoding_standardized') and train_dataset._pert_encoding_standardized:
+            all_pert_names = set(train_dataset.perturbation_names + test_perturbation_names)
+            actual_pert_dim = len(all_pert_names)
+            if train_dataset.perturbations.shape[1] == actual_pert_dim:
+                return actual_pert_dim, sorted(list(all_pert_names))
         test_pert_names = test_perturbation_names
     else:
         test_pert_names = []
@@ -570,8 +575,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
-    test_path = "/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
+    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
+    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)

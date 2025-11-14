@@ -612,6 +612,10 @@ def evaluate_and_save_model(model, test_loader, device, save_path,
     print(f"\nModel and evaluation results saved to: {save_path}")
     return results
 def standardize_perturbation_encoding(train_dataset, test_dataset):
+    if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
+        if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
+            if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
+                return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
     train_pert_dim = train_dataset.perturbations.shape[1]
     test_pert_dim = test_dataset.perturbations.shape[1]
     max_pert_dim = max(train_pert_dim, test_pert_dim)
@@ -634,7 +638,9 @@ def standardize_perturbation_encoding(train_dataset, test_dataset):
     test_pert_encoded = test_pert_encoded.reindex(
         columns=all_pert_names, fill_value=0)
     test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+    test_dataset._pert_encoding_standardized = True
     actual_pert_dim = len(all_pert_names)
+    train_dataset._pert_encoding_standardized = True
     print_log(
         f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
     print_log(f"All perturbation types: {all_pert_names}")
@@ -661,8 +667,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/datasets/SchiebingerLander2019_train_processed.h5ad"
-    test_path = "/datasets/SchiebingerLander2019_test_processed.h5ad"
+    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/SchiebingerLander2019_train_processed.h5ad"
+    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/SchiebingerLander2019_test_processed.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)
