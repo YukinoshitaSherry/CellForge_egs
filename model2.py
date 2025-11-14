@@ -140,10 +140,11 @@ class GeneExpressionDataset(Dataset):
     def __len__(self):
         return len(self.adata)
     def __getitem__(self, idx):
-        x_baseline = self.expression_data[idx]
+        x_current = self.expression_data[idx]
         pert = self.perturbations[idx]
         dose = self.dose_values[idx]
         if idx in self._control_indices:
+            x_baseline = x_current
             if len(self._non_control_pert_names) > 0 and len(self._non_control_indices) > 0:
                 if self.is_train:
                     pert_name = np.random.choice(self._non_control_pert_names)
@@ -187,6 +188,8 @@ class GeneExpressionDataset(Dataset):
                 else:
                     baseline_idx = int(self._control_indices[idx % len(self._control_indices)])
                 x_baseline = self.expression_data[baseline_idx]
+            else:
+                x_baseline = x_current
             x_target = self.original_expression_data[idx]
             pert_target = pert
             dose_target = dose

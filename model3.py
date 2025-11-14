@@ -122,10 +122,11 @@ class CytokineTrajectoryDataset(Dataset):
     def __len__(self):
         return len(self.adata)
     def __getitem__(self, idx):
-        x_baseline = self.expression_data[idx]
+        x_current = self.expression_data[idx]
         pert = self.perturbations[idx]
         time_emb = self.time_embeddings[idx]
         if idx in self._control_indices:
+            x_baseline = x_current
             if len(self._non_control_pert_names) > 0 and len(self._non_control_indices) > 0:
                 if self.is_train:
                     target_idx = int(np.random.choice(self._non_control_indices))
@@ -146,13 +147,14 @@ class CytokineTrajectoryDataset(Dataset):
                     x_target = self.original_expression_data[idx]
                     pert_target = pert
         else:
-            baseline_idx = None
             if len(self._control_indices) > 0:
                 if self.is_train:
                     baseline_idx = int(np.random.choice(self._control_indices))
                 else:
                     baseline_idx = int(self._control_indices[idx % len(self._control_indices)])
                 x_baseline = self.expression_data[baseline_idx]
+            else:
+                x_baseline = x_current
             x_target = self.original_expression_data[idx]
             pert_target = pert
         if self.augment and self.training:
