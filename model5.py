@@ -220,6 +220,7 @@ class ConditionalDiffusionModel(nn.Module):
         self.hidden_dim = ((hidden_dim + n_heads - 1) // n_heads) * n_heads
         self.diffusion_steps = diffusion_steps
         self.time_emb_dim = time_emb_dim
+        self.pert_emb_dim = pert_emb_dim
         self.time_embeddings = SinusoidalPositionEmbeddings(time_emb_dim)
         self.time_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
@@ -587,14 +588,16 @@ def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusio
         'scaler': scaler,
         'model_config': {
             'input_dim': model.input_dim,   
-            'output_dim': train_dataset.n_genes,
-            'train_pert_dim': train_dataset.perturbations.shape[1],
-            'test_pert_dim': test_dataset.perturbations.shape[1],
+            'output_dim': model.model.output_dim,
+            'train_pert_dim': model.model.train_pert_dim,
+            'test_pert_dim': model.model.test_pert_dim,
             'hidden_dim': getattr(model.model, 'hidden_dim', 512),
             'n_layers': getattr(model.model, 'n_layers', 4),
             'n_heads': getattr(model.model, 'n_heads', 8),
             'dropout': getattr(model.model, 'dropout', 0.1),
-            'diffusion_steps': getattr(model, 'diffusion_steps', 1000)
+            'diffusion_steps': getattr(model, 'diffusion_steps', 1000),
+            'time_emb_dim': model.model.time_emb_dim,
+            'pert_emb_dim': model.model.pert_emb_dim
         }
     }, save_path)
     metrics_df = pd.DataFrame({
@@ -748,8 +751,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print('CUDA not available, using CPU')
     print('Loading ATAC data...')
-    train_path = "/datasets/LiscovitchBrauerSanjana2021_train.h5ad"
-    test_path = "/datasets/LiscovitchBrauerSanjana2021_test.h5ad"
+    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/LiscovitchBrauerSanjana2021_train.h5ad"
+    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/LiscovitchBrauerSanjana2021_test.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")

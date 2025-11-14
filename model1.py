@@ -211,7 +211,7 @@ class PerturbationEmbedding(nn.Module):
         self.embedding = nn.Linear(pert_dim, emb_dim)
     def forward(self, pert):
         return self.embedding(pert)
-class CrossAttention(nn.Module):
+class SingleTokenAttention(nn.Module):
     def __init__(self, query_dim, key_dim, value_dim, hidden_dim, n_heads=8, dropout=0.1):
         super().__init__()
         assert hidden_dim % n_heads == 0, "hidden_dim must be divisible by n_heads"
@@ -303,7 +303,7 @@ class HybridAttentionModel(nn.Module):
                 nn.Dropout(dropout)
             )
             pert_out_dim = hidden_dim
-        self.cross_attention = CrossAttention(
+        self.cross_attention = SingleTokenAttention(
             query_dim=pert_out_dim,
             key_dim=expr_out_dim,
             value_dim=expr_out_dim,
@@ -531,8 +531,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
-    test_path = "/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
+    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
+    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)

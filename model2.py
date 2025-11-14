@@ -794,7 +794,6 @@ def objective(trial, timestamp):
         train_loss = train_model(
             model, train_loader, optimizer, scheduler, device, loss_weights)
         val_metrics = evaluate_model(model, test_loader, device, loss_weights)
-        scheduler.step()
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             patience_counter = 0
@@ -990,8 +989,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
-    test_path = "/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
+    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
+    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")
