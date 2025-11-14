@@ -5,7 +5,7 @@ import numpy as np
 import scanpy as sc
 import scipy
 import anndata
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from tqdm import tqdm
@@ -420,12 +420,19 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
         'r2': total_r2 / len(test_loader),
         'pearson': total_pearson / len(test_loader)
     }
-def standardize_perturbation_encoding(train_dataset, test_dataset):
+def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=None):
+    if test_dataset is not None:
+        if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
+            if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
+                if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
+                    return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+        test_pert_names = test_dataset.perturbation_names
+    elif test_perturbation_names is not None:
+        test_pert_names = test_perturbation_names
+    else:
+        test_pert_names = []
     train_pert_dim = train_dataset.perturbations.shape[1]
-    test_pert_dim = test_dataset.perturbations.shape[1]
-    max_pert_dim = max(train_pert_dim, test_pert_dim)
-    all_pert_names = set(train_dataset.perturbation_names +
-                         test_dataset.perturbation_names)
+    all_pert_names = set(train_dataset.perturbation_names + test_pert_names)
     all_pert_names = sorted(list(all_pert_names))
     train_pert_df = pd.DataFrame(train_dataset.adata.obs['perturbation'])
     train_pert_encoded = pd.get_dummies(train_pert_df['perturbation'])
@@ -438,18 +445,21 @@ def standardize_perturbation_encoding(train_dataset, test_dataset):
     for i, pair in enumerate(train_dataset.pairs):
         pert_idx = pair['perturbed_idx']
         train_dataset.pairs[i]['perturbation'] = train_dataset.perturbations[pert_idx]
-    test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
-    test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
-    for pert_name in all_pert_names:
-        if pert_name not in test_pert_encoded.columns:
-            test_pert_encoded[pert_name] = 0
-    test_pert_encoded = test_pert_encoded.reindex(
-        columns=all_pert_names, fill_value=0)
-    test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
-    for i, pair in enumerate(test_dataset.pairs):
-        pert_idx = pair['perturbed_idx']
-        test_dataset.pairs[i]['perturbation'] = test_dataset.perturbations[pert_idx]
+    if test_dataset is not None:
+        test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
+        test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
+        for pert_name in all_pert_names:
+            if pert_name not in test_pert_encoded.columns:
+                test_pert_encoded[pert_name] = 0
+        test_pert_encoded = test_pert_encoded.reindex(
+            columns=all_pert_names, fill_value=0)
+        test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+        for i, pair in enumerate(test_dataset.pairs):
+            pert_idx = pair['perturbed_idx']
+            test_dataset.pairs[i]['perturbation'] = test_dataset.perturbations[pert_idx]
+        test_dataset._pert_encoding_standardized = True
     actual_pert_dim = len(all_pert_names)
+    train_dataset._pert_encoding_standardized = True
     print_log(
         f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
     print_log(f"All perturbation types: {all_pert_names}")
@@ -483,14 +493,8 @@ def objective(trial):
     train_dataset = ControlPerturbedDataset(
         train_adata, scaler=scaler, pca_model=None, pca_dim=128,
         fit_pca=False, augment=True, is_train=True, common_genes_info=common_genes_info)
-    train_control_baseline = None
-    if hasattr(train_dataset, 'control_baseline') and train_dataset.control_baseline is not None:
-        train_control_baseline = train_dataset.control_baseline
-    test_dataset = ControlPerturbedDataset(
-        test_adata, scaler=scaler, pca_model=None, pca_dim=128,
-        fit_pca=False, augment=False, is_train=False, common_genes_info=common_genes_info,
-        train_control_baseline=train_control_baseline)
-    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
+    test_perturbation_names = list(test_adata.obs['perturbation'].unique())
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=test_perturbation_names)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = HybridAttentionModel(
@@ -516,7 +520,11 @@ def objective(trial):
         weight_decay=weight_decay,
         betas=(0.9, 0.999)
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=learning_rate,
@@ -525,13 +533,12 @@ def objective(trial):
         pct_start=0.1,
         anneal_strategy='cos'
     )
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     best_val_loss = float('inf')
     patience = 3
     patience_counter = 0
     for epoch in range(3):
         train_loss = train_model(model, train_loader, optimizer, scheduler, device, vae_beta=vae_beta, max_pert_dim=pert_dim)
-        val_metrics = evaluate_model(model, test_loader, device, vae_beta=vae_beta, max_pert_dim=pert_dim)
+        val_metrics = evaluate_model(model, val_loader, device, vae_beta=vae_beta, max_pert_dim=pert_dim)
         val_loss = val_metrics['loss']
         if val_loss < best_val_loss:
             best_val_loss = val_loss

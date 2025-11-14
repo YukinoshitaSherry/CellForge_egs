@@ -5,7 +5,7 @@ import numpy as np
 import scanpy as sc
 import scipy
 import anndata
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from tqdm import tqdm
@@ -713,7 +713,7 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None)
         'R2_DE': r2_de
     }
 def objective(trial, timestamp):
-    global train_dataset, test_dataset, device, pca_model, scaler
+    global train_dataset, test_dataset, device, pca_model, scaler, test_adata
     params = {
         'latent_dim': trial.suggest_categorical('latent_dim', [64, 128, 256]),
         'chem_dim': trial.suggest_categorical('chem_dim', [32, 64, 128]),
@@ -737,8 +737,9 @@ def objective(trial, timestamp):
             params['hidden_dim'] += params['n_heads']
         else:
             params['hidden_dim'] = 512
+    test_perturbation_names = list(test_adata.obs['perturbation'].unique())
     max_pert_dim, all_pert_names = standardize_perturbation_encoding(
-        train_dataset, test_dataset)
+        train_dataset, test_dataset=None, test_perturbation_names=test_perturbation_names)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = CondOTGRNModel(
@@ -764,15 +765,18 @@ def objective(trial, timestamp):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=params['batch_size'],
         shuffle=True,
         num_workers=4,
         pin_memory=True
     )
-    test_loader = DataLoader(
-        test_dataset,
+    val_loader = DataLoader(
+        val_subset,
         batch_size=params['batch_size'],
         shuffle=False,
         num_workers=4,
@@ -793,7 +797,7 @@ def objective(trial, timestamp):
     for epoch in range(max_epochs):
         train_loss = train_model(
             model, train_loader, optimizer, scheduler, device, loss_weights)
-        val_metrics = evaluate_model(model, test_loader, device, loss_weights)
+        val_metrics = evaluate_model(model, val_loader, device, loss_weights)
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             patience_counter = 0
@@ -916,16 +920,19 @@ def create_anndata_for_analysis(predictions, targets, gene_names, perturbations=
     print_log(f"  Predictions: {pred_adata.shape}")
     print_log(f"  Targets: {target_adata.shape}")
     return pred_adata, target_adata
-def standardize_perturbation_encoding(train_dataset, test_dataset):
-    if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
-        if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
-            if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
-                return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=None):
+    if test_dataset is not None:
+        if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
+            if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
+                if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
+                    return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+        test_pert_names = test_dataset.perturbation_names
+    elif test_perturbation_names is not None:
+        test_pert_names = test_perturbation_names
+    else:
+        test_pert_names = []
     train_pert_dim = train_dataset.perturbations.shape[1]
-    test_pert_dim = test_dataset.perturbations.shape[1]
-    max_pert_dim = max(train_pert_dim, test_pert_dim)
-    all_pert_names = set(train_dataset.perturbation_names +
-                         test_dataset.perturbation_names)
+    all_pert_names = set(train_dataset.perturbation_names + test_pert_names)
     all_pert_names = sorted(list(all_pert_names))
     train_pert_df = pd.DataFrame(train_dataset.adata.obs['perturbation'])
     train_pert_encoded = pd.get_dummies(train_pert_df['perturbation'])
@@ -935,17 +942,18 @@ def standardize_perturbation_encoding(train_dataset, test_dataset):
     train_pert_encoded = train_pert_encoded.reindex(
         columns=all_pert_names, fill_value=0)
     train_dataset.perturbations = train_pert_encoded.values.astype(np.float32)
-    test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
-    test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
-    for pert_name in all_pert_names:
-        if pert_name not in test_pert_encoded.columns:
-            test_pert_encoded[pert_name] = 0
-    test_pert_encoded = test_pert_encoded.reindex(
-        columns=all_pert_names, fill_value=0)
-    test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+    if test_dataset is not None:
+        test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
+        test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
+        for pert_name in all_pert_names:
+            if pert_name not in test_pert_encoded.columns:
+                test_pert_encoded[pert_name] = 0
+        test_pert_encoded = test_pert_encoded.reindex(
+            columns=all_pert_names, fill_value=0)
+        test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+        test_dataset._pert_encoding_standardized = True
     actual_pert_dim = len(all_pert_names)
     train_dataset._pert_encoding_standardized = True
-    test_dataset._pert_encoding_standardized = True
     print_log(
         f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
     print_log(f"All perturbation types: {all_pert_names}")
@@ -995,8 +1003,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
-    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
+    train_path = "/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
+    test_path = "/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")

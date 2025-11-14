@@ -5,7 +5,7 @@ import numpy as np
 import scanpy as sc
 import scipy
 import anndata
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from tqdm import tqdm
@@ -401,16 +401,19 @@ def calculate_metrics(pred, true, control_baseline=None):
         'PCC_DE': pcc_de,
         'R2_DE': r2_de
     }
-def standardize_perturbation_encoding(train_dataset, test_dataset):
-    if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
-        if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
-            if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
-                return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=None):
+    if test_dataset is not None:
+        if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
+            if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
+                if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
+                    return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+        test_pert_names = test_dataset.perturbation_names
+    elif test_perturbation_names is not None:
+        test_pert_names = test_perturbation_names
+    else:
+        test_pert_names = []
     train_pert_dim = train_dataset.perturbations.shape[1]
-    test_pert_dim = test_dataset.perturbations.shape[1]
-    max_pert_dim = max(train_pert_dim, test_pert_dim)
-    all_pert_names = set(train_dataset.perturbation_names +
-                         test_dataset.perturbation_names)
+    all_pert_names = set(train_dataset.perturbation_names + test_pert_names)
     all_pert_names = sorted(list(all_pert_names))
     train_pert_df = pd.DataFrame(train_dataset.adata.obs['perturbation'])
     train_pert_encoded = pd.get_dummies(train_pert_df['perturbation'])
@@ -423,26 +426,27 @@ def standardize_perturbation_encoding(train_dataset, test_dataset):
     for i, pair in enumerate(train_dataset.pairs):
         pert_idx = pair['perturbed_idx']
         train_dataset.pairs[i]['perturbation'] = train_dataset.perturbations[pert_idx]
-    test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
-    test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
-    for pert_name in all_pert_names:
-        if pert_name not in test_pert_encoded.columns:
-            test_pert_encoded[pert_name] = 0
-    test_pert_encoded = test_pert_encoded.reindex(
-        columns=all_pert_names, fill_value=0)
-    test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
-    for i, pair in enumerate(test_dataset.pairs):
-        pert_idx = pair['perturbed_idx']
-        test_dataset.pairs[i]['perturbation'] = test_dataset.perturbations[pert_idx]
+    if test_dataset is not None:
+        test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
+        test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
+        for pert_name in all_pert_names:
+            if pert_name not in test_pert_encoded.columns:
+                test_pert_encoded[pert_name] = 0
+        test_pert_encoded = test_pert_encoded.reindex(
+            columns=all_pert_names, fill_value=0)
+        test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+        for i, pair in enumerate(test_dataset.pairs):
+            pert_idx = pair['perturbed_idx']
+            test_dataset.pairs[i]['perturbation'] = test_dataset.perturbations[pert_idx]
+        test_dataset._pert_encoding_standardized = True
     actual_pert_dim = len(all_pert_names)
     train_dataset._pert_encoding_standardized = True
-    test_dataset._pert_encoding_standardized = True
     print_log(
         f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
     print_log(f"All perturbation types: {all_pert_names}")
     return actual_pert_dim, all_pert_names
 def objective(trial, timestamp):
-    global train_dataset, test_dataset, device, pca_model
+    global train_dataset, test_dataset, device, pca_model, test_adata
     params = {
         'pca_dim': 128,
         'n_hidden': trial.suggest_int('n_hidden', 256, 1024),
@@ -458,7 +462,8 @@ def objective(trial, timestamp):
         'use_pert_emb': trial.suggest_categorical('use_pert_emb', [True, False]),
         'pert_emb_dim': trial.suggest_int('pert_emb_dim', 32, 128)
     }
-    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
+    test_perturbation_names = list(test_adata.obs['perturbation'].unique())
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=test_perturbation_names)
     n_genes = train_dataset.n_genes
     print(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = CITERNATransformerModel(
@@ -482,15 +487,18 @@ def objective(trial, timestamp):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=params['batch_size'],
         shuffle=True,
         num_workers=4,
         pin_memory=True
     )
-    test_loader = DataLoader(
-        test_dataset,
+    val_loader = DataLoader(
+        val_subset,
         batch_size=params['batch_size'],
         shuffle=False,
         num_workers=4,
@@ -520,7 +528,7 @@ def objective(trial, timestamp):
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for batch in test_loader:
+            for batch in val_loader:
                 baseline_expr, pert, target_expr = batch
                 baseline_expr, pert, target_expr = baseline_expr.to(
                     device), pert.to(device), target_expr.to(device)
@@ -529,7 +537,7 @@ def objective(trial, timestamp):
                 pert_loss = F.mse_loss(pert_pred, pert)
                 loss = mse_loss + params['aux_weight'] * pert_loss
                 val_loss += loss.item()
-        val_loss /= len(test_loader)
+        val_loss /= len(val_loader)
         scheduler.step()
         if val_loss < best_val_loss:
             best_val_loss = val_loss

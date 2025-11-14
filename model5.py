@@ -5,7 +5,7 @@ import numpy as np
 import scanpy as sc
 import scipy
 import anndata
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from tqdm import tqdm
@@ -24,6 +24,7 @@ warnings.filterwarnings('ignore')
 def print_log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
 train_adata = None
+test_adata = None
 train_dataset = None
 test_dataset = None
 device = None
@@ -572,16 +573,19 @@ def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusio
           float_format=lambda x: '{:.6f}'.format(x)))
     print(f"\nModel and evaluation results saved to: {save_path}")
     return results
-def standardize_perturbation_encoding(train_dataset, test_dataset):
-    if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
-        if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
-            if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
-                return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=None):
+    if test_dataset is not None:
+        if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
+            if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
+                if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
+                    return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+        test_pert_names = test_dataset.perturbation_names
+    elif test_perturbation_names is not None:
+        test_pert_names = test_perturbation_names
+    else:
+        test_pert_names = []
     train_pert_dim = train_dataset.perturbations.shape[1]
-    test_pert_dim = test_dataset.perturbations.shape[1]
-    max_pert_dim = max(train_pert_dim, test_pert_dim)
-    all_pert_names = set(train_dataset.perturbation_names +
-                         test_dataset.perturbation_names)
+    all_pert_names = set(train_dataset.perturbation_names + test_pert_names)
     all_pert_names = sorted(list(all_pert_names))
     train_pert_df = pd.DataFrame(train_dataset.adata.obs['perturbation'])
     train_pert_encoded = pd.get_dummies(train_pert_df['perturbation'])
@@ -591,23 +595,24 @@ def standardize_perturbation_encoding(train_dataset, test_dataset):
     train_pert_encoded = train_pert_encoded.reindex(
         columns=all_pert_names, fill_value=0)
     train_dataset.perturbations = train_pert_encoded.values.astype(np.float32)
-    test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
-    test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
-    for pert_name in all_pert_names:
-        if pert_name not in test_pert_encoded.columns:
-            test_pert_encoded[pert_name] = 0
-    test_pert_encoded = test_pert_encoded.reindex(
-        columns=all_pert_names, fill_value=0)
-    test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+    if test_dataset is not None:
+        test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
+        test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
+        for pert_name in all_pert_names:
+            if pert_name not in test_pert_encoded.columns:
+                test_pert_encoded[pert_name] = 0
+        test_pert_encoded = test_pert_encoded.reindex(
+            columns=all_pert_names, fill_value=0)
+        test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+        test_dataset._pert_encoding_standardized = True
     actual_pert_dim = len(all_pert_names)
     train_dataset._pert_encoding_standardized = True
-    test_dataset._pert_encoding_standardized = True
     print_log(
         f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
     print_log(f"All perturbation types: {all_pert_names}")
     return actual_pert_dim, all_pert_names
 def objective(trial, timestamp):
-    global train_dataset, test_dataset, device, pca_model
+    global train_dataset, test_dataset, device, pca_model, test_adata
     params = {
         'pca_dim': 128,
         'n_hidden': trial.suggest_int('n_hidden', 256, 1024),
@@ -622,7 +627,8 @@ def objective(trial, timestamp):
         'pert_emb_dim': trial.suggest_int('pert_emb_dim', 32, 128),
         'diffusion_steps': trial.suggest_categorical('diffusion_steps', [500, 1000, 2000])
     }
-    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
+    test_perturbation_names = list(test_adata.obs['perturbation'].unique())
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=test_perturbation_names)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     base_model = ConditionalDiffusionModel(
@@ -650,15 +656,18 @@ def objective(trial, timestamp):
         T_mult=2,
         eta_min=1e-6
     )
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=params['batch_size'],
         shuffle=True,
         num_workers=4,
         pin_memory=True
     )
-    test_loader = DataLoader(
-        test_dataset,
+    val_loader = DataLoader(
+        val_subset,
         batch_size=params['batch_size'],
         shuffle=False,
         num_workers=4,
@@ -692,7 +701,7 @@ def objective(trial, timestamp):
         val_batches_processed = 0
         max_val_batches = 50
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc=f'Validation Epoch {epoch+1}', leave=False):
+            for batch in tqdm(val_loader, desc=f'Validation Epoch {epoch+1}', leave=False):
                 if val_batches_processed >= max_val_batches:
                     break
                 x_baseline, pert, x_target_delta = batch
@@ -819,7 +828,7 @@ def main(gpu_id=None):
     print('Best parameters:')
     for key, value in study.best_params.items():
         print(f'{key}: {value}')
-    pert_dim = train_dataset.perturbations.shape[1]
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
     best_params = study.best_params
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
