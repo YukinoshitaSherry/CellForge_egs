@@ -917,6 +917,10 @@ def create_anndata_for_analysis(predictions, targets, gene_names, perturbations=
     print_log(f"  Targets: {target_adata.shape}")
     return pred_adata, target_adata
 def standardize_perturbation_encoding(train_dataset, test_dataset):
+    if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
+        if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
+            if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
+                return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
     train_pert_dim = train_dataset.perturbations.shape[1]
     test_pert_dim = test_dataset.perturbations.shape[1]
     max_pert_dim = max(train_pert_dim, test_pert_dim)
@@ -940,6 +944,8 @@ def standardize_perturbation_encoding(train_dataset, test_dataset):
         columns=all_pert_names, fill_value=0)
     test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
     actual_pert_dim = len(all_pert_names)
+    train_dataset._pert_encoding_standardized = True
+    test_dataset._pert_encoding_standardized = True
     print_log(
         f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
     print_log(f"All perturbation types: {all_pert_names}")
@@ -989,8 +995,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
-    test_path = "/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
+    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
+    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")
