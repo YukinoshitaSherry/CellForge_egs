@@ -29,6 +29,7 @@ test_dataset = None
 device = None
 pca_model = None
 scaler = None
+common_genes_info = None
 class ControlPerturbedDataset(Dataset):
     def __init__(self, adata, perturbation_key='perturbation', scaler=None,
                  pca_model=None, pca_dim=128, fit_pca=False, augment=False,
@@ -88,6 +89,7 @@ class ControlPerturbedDataset(Dataset):
             unique_perturbations = perturbation_col.unique()[:10]  
             print_log(f"DEBUG: Sample perturbation values: {unique_perturbations}")
             print_log("DEBUG: Attempting to find control samples with alternative patterns...")
+        self.perturbation_names = list(perturbation_col.unique())
         self.perturbations = pd.get_dummies(perturbation_col).values.astype(np.float32)
         print_log(f"Perturbation dimension: {self.perturbations.shape[1]}")
         if len(control_indices) == 0:
@@ -418,9 +420,42 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
         'r2': total_r2 / len(test_loader),
         'pearson': total_pearson / len(test_loader)
     }
+def standardize_perturbation_encoding(train_dataset, test_dataset):
+    train_pert_dim = train_dataset.perturbations.shape[1]
+    test_pert_dim = test_dataset.perturbations.shape[1]
+    max_pert_dim = max(train_pert_dim, test_pert_dim)
+    all_pert_names = set(train_dataset.perturbation_names +
+                         test_dataset.perturbation_names)
+    all_pert_names = sorted(list(all_pert_names))
+    train_pert_df = pd.DataFrame(train_dataset.adata.obs['perturbation'])
+    train_pert_encoded = pd.get_dummies(train_pert_df['perturbation'])
+    for pert_name in all_pert_names:
+        if pert_name not in train_pert_encoded.columns:
+            train_pert_encoded[pert_name] = 0
+    train_pert_encoded = train_pert_encoded.reindex(
+        columns=all_pert_names, fill_value=0)
+    train_dataset.perturbations = train_pert_encoded.values.astype(np.float32)
+    for i, pair in enumerate(train_dataset.pairs):
+        pert_idx = pair['perturbed_idx']
+        train_dataset.pairs[i]['perturbation'] = train_dataset.perturbations[pert_idx]
+    test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
+    test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
+    for pert_name in all_pert_names:
+        if pert_name not in test_pert_encoded.columns:
+            test_pert_encoded[pert_name] = 0
+    test_pert_encoded = test_pert_encoded.reindex(
+        columns=all_pert_names, fill_value=0)
+    test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+    for i, pair in enumerate(test_dataset.pairs):
+        pert_idx = pair['perturbed_idx']
+        test_dataset.pairs[i]['perturbation'] = test_dataset.perturbations[pert_idx]
+    actual_pert_dim = len(all_pert_names)
+    print_log(
+        f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
+    print_log(f"All perturbation types: {all_pert_names}")
+    return actual_pert_dim, all_pert_names
 def objective(trial):
-    global train_adata, train_dataset, test_dataset, device, pca_model, scaler
-    pca_dim = trial.suggest_categorical('pca_dim', [64, 128, 256])
+    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler, common_genes_info
     n_hidden = trial.suggest_categorical('n_hidden', [256, 512, 1024])
     n_layers = trial.suggest_int('n_layers', 1, 3)
     n_heads = trial.suggest_categorical('n_heads', [4, 8])
@@ -447,18 +482,15 @@ def objective(trial):
     pca_model = None
     train_dataset = ControlPerturbedDataset(
         train_adata, scaler=scaler, pca_model=None, pca_dim=128,
-        fit_pca=False, augment=True, is_train=True, common_genes_info=None)
+        fit_pca=False, augment=True, is_train=True, common_genes_info=common_genes_info)
     train_control_baseline = None
     if hasattr(train_dataset, 'control_baseline') and train_dataset.control_baseline is not None:
         train_control_baseline = train_dataset.control_baseline
     test_dataset = ControlPerturbedDataset(
         test_adata, scaler=scaler, pca_model=None, pca_dim=128,
-        fit_pca=False, augment=False, is_train=False, common_genes_info=None,
+        fit_pca=False, augment=False, is_train=False, common_genes_info=common_genes_info,
         train_control_baseline=train_control_baseline)
-    train_pert_dim = train_dataset.perturbations.shape[1]
-    test_pert_dim = test_dataset.perturbations.shape[1]
-    pert_dim = max(train_pert_dim, test_pert_dim)
-    print_log(f"Train perturbation dim: {train_pert_dim}, Test perturbation dim: {test_pert_dim}, Using max: {pert_dim}")
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = HybridAttentionModel(
@@ -484,15 +516,15 @@ def objective(trial):
         weight_decay=weight_decay,
         betas=(0.9, 0.999)
     )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=learning_rate,
         epochs=3,
-        steps_per_epoch=len(train_dataset) // batch_size + 1,
+        steps_per_epoch=len(train_loader),
         pct_start=0.1,
         anneal_strategy='cos'
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     best_val_loss = float('inf')
     patience = 3
@@ -510,7 +542,7 @@ def objective(trial):
                 break
     return best_val_loss
 def main(gpu_id=None):
-    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler
+    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler, common_genes_info
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print_log(f'Training started at: {timestamp}')
     if torch.cuda.is_available():
@@ -531,8 +563,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
-    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
+    train_path = "/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
+    test_path = "/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)
@@ -624,17 +656,14 @@ def main(gpu_id=None):
         perturbation_key='perturbation',
         scaler=scaler,
         pca_model=pca_model,
-        pca_dim=best_params['pca_dim'],
+        pca_dim=128,
         fit_pca=False,
         augment=False,
         is_train=False,
         common_genes_info=common_genes_info,
         train_control_baseline=train_control_baseline
     )
-    train_pert_dim = train_dataset.perturbations.shape[1]
-    test_pert_dim = test_dataset.perturbations.shape[1]
-    pert_dim = max(train_pert_dim, test_pert_dim)
-    print_log(f"Train perturbation dim: {train_pert_dim}, Test perturbation dim: {test_pert_dim}, Using max: {pert_dim}")
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = HybridAttentionModel(
@@ -660,15 +689,15 @@ def main(gpu_id=None):
         weight_decay=best_params['weight_decay'],
         betas=(0.9, 0.999)
     )
+    train_loader = DataLoader(train_dataset, batch_size=best_params['batch_size'], shuffle=True)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=best_params['learning_rate'],
         epochs=200,
-        steps_per_epoch=len(train_dataset) // best_params['batch_size'] + 1,
+        steps_per_epoch=len(train_loader),
         pct_start=0.1,
         anneal_strategy='cos'
     )
-    train_loader = DataLoader(train_dataset, batch_size=best_params['batch_size'], shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=best_params['batch_size'], shuffle=False)
     print_log("Starting training...")
     best_loss = float('inf')

@@ -989,8 +989,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
-    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
+    train_path = "/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
+    test_path = "/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")

@@ -69,10 +69,10 @@ class ATACDataset(Dataset):
         self.n_genes = data.shape[1]
         self.pca = pca_model if pca_model is not None else None
         self.pca_dim = pca_dim if pca_model is not None else None
+        self.perturbation_names = list(adata.obs[perturbation_key].unique())
         self.perturbations = pd.get_dummies(adata.obs[perturbation_key]).values
         print(
             f"{'train' if is_train else 'test'} set perturbation dimension: {self.perturbations.shape[1]}")
-        self.perturbation_names = list(adata.obs[perturbation_key].unique())
         perturbation_labels = adata.obs[perturbation_key].astype(str).values
         perturbation_labels = np.array(perturbation_labels, dtype='U')
         lower_labels = np.char.lower(perturbation_labels)
@@ -216,6 +216,7 @@ class ConditionalDiffusionModel(nn.Module):
         self.model_in_dim = model_in_dim
         self.train_pert_dim = train_pert_dim
         self.test_pert_dim = test_pert_dim
+        assert train_pert_dim == test_pert_dim, "After standardization, train_pert_dim and test_pert_dim must be equal"
         self.use_bottleneck = use_bottleneck
         self.hidden_dim = ((hidden_dim + n_heads - 1) // n_heads) * n_heads
         self.diffusion_steps = diffusion_steps
@@ -246,14 +247,8 @@ class ConditionalDiffusionModel(nn.Module):
                 nn.GELU()
             )
         self.model_input_proj = nn.Linear(self.model_in_dim, self.hidden_dim)
-        self.train_pert_encoder = nn.Sequential(
+        self.pert_encoder = nn.Sequential(
             nn.Linear(train_pert_dim, pert_emb_dim),
-            nn.LayerNorm(pert_emb_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        self.test_pert_encoder = nn.Sequential(
-            nn.Linear(test_pert_dim, pert_emb_dim),
             nn.LayerNorm(pert_emb_dim),
             nn.GELU(),
             nn.Dropout(dropout)
@@ -296,11 +291,7 @@ class ConditionalDiffusionModel(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout)
         )
-        self.train_perturbation_head = nn.Linear(self.hidden_dim//2, train_pert_dim)
-        self.test_perturbation_head = nn.Linear(self.hidden_dim//2, test_pert_dim)
-        if train_pert_dim == test_pert_dim:
-            self.test_perturbation_head.weight.data = self.train_perturbation_head.weight.data.clone()
-            self.test_perturbation_head.bias.data = self.train_perturbation_head.bias.data.clone()
+        self.perturbation_head = nn.Linear(self.hidden_dim//2, train_pert_dim)
         self.apply(self._init_weights)
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -310,27 +301,14 @@ class ConditionalDiffusionModel(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
-    def forward(self, x, pert, timestep, is_train=True, force_use_test_encoder=False):
+    def forward(self, x, pert, timestep, is_train=True):
         assert x.dim() == 2 and x.size(1) == self.input_dim, \
             f"Expected x shape [B, {self.input_dim}], got {x.shape}"
         batch_size = x.shape[0]
         x_proj = self.input_proj(x)
         time_emb = self.time_embeddings(timestep)
         time_emb = self.time_mlp(time_emb)
-        if is_train and force_use_test_encoder and self.train_pert_dim != self.test_pert_dim:
-            if pert.shape[1] == self.train_pert_dim:
-                if self.test_pert_dim > self.train_pert_dim:
-                    pad_size = self.test_pert_dim - self.train_pert_dim
-                    pert_adapted = F.pad(pert, (0, pad_size), mode='constant', value=0)
-                else:
-                    pert_adapted = pert[:, :self.test_pert_dim]
-                pert_emb = self.test_pert_encoder(pert_adapted)
-            else:
-                pert_emb = self.test_pert_encoder(pert)
-        elif is_train:
-            pert_emb = self.train_pert_encoder(pert)
-        else:
-            pert_emb = self.test_pert_encoder(pert)
+        pert_emb = self.pert_encoder(pert)
         cond_emb = torch.cat([pert_emb, time_emb], dim=-1)
         cond_emb = self.cond_proj(cond_emb)
         x_proj_model = self.model_input_proj(x_proj)
@@ -340,12 +318,7 @@ class ConditionalDiffusionModel(nn.Module):
         noise_pred = self.output_head(noise_pred_proj)
         output = self.output_head(noise_pred_proj)  
         x_pert_feat = self.pert_head_shared(x_trans)
-        if is_train:
-            pert_pred = self.train_perturbation_head(x_pert_feat)
-            if self.train_pert_dim != self.test_pert_dim:
-                _ = self.test_perturbation_head(x_pert_feat)
-        else:
-            pert_pred = self.test_perturbation_head(x_pert_feat)
+        pert_pred = self.perturbation_head(x_pert_feat)
         return noise_pred, pert_pred, output
 class DiffusionModel(nn.Module):
     def __init__(self, model, diffusion_steps=1000, beta_start=1e-4, beta_end=0.02):
@@ -395,36 +368,28 @@ class DiffusionModel(nn.Module):
                 (x.shape[0],), t, device=device, dtype=torch.long)
             x = self.p_sample(x, pert, t_tensor, is_train)
         return x
-    def forward(self, x_start, pert, is_train=True, force_use_test_encoder=False):
+    def forward(self, x_start, pert, is_train=True):
         batch_size = x_start.shape[0]
         device = x_start.device
         t = torch.randint(0, self.diffusion_steps,
                           (batch_size,), device=device)
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start, t, noise)
-        pred_noise, pert_pred, _ = self.model(x_noisy, pert, t, is_train, force_use_test_encoder=force_use_test_encoder)
+        pred_noise, pert_pred, _ = self.model(x_noisy, pert, t, is_train)
         return pred_noise, pert_pred, noise, t
 def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.1):
     model.train()
     total_loss = 0
     accumulation_steps = 4
     optimizer.zero_grad()
-    force_test_encoder_interval = 10
-    train_pert_dim = model.model.train_pert_dim
-    test_pert_dim = model.model.test_pert_dim
-    use_test_encoder = (train_pert_dim != test_pert_dim)
     for i, batch in enumerate(train_loader):
         x_baseline, pert, x_target_delta = batch
         x_baseline, pert, x_target_delta = x_baseline.to(
             device), pert.to(device), x_target_delta.to(device)
         x_target_abs = x_baseline + x_target_delta
-        force_use_test = use_test_encoder and (i % force_test_encoder_interval == 0)
-        pred_noise, pert_pred, noise, t = model(x_target_abs, pert, is_train=True, force_use_test_encoder=force_use_test)
+        pred_noise, pert_pred, noise, t = model(x_target_abs, pert, is_train=True)
         diffusion_loss = F.mse_loss(pred_noise, noise)
-        if pert_pred.shape[1] == pert.shape[1]:
-            aux_loss = F.mse_loss(pert_pred, pert)
-        else:
-            aux_loss = torch.tensor(0.0, device=device)
+        aux_loss = F.mse_loss(pert_pred, pert)
         loss = diffusion_loss + aux_weight * aux_loss
         loss = loss / accumulation_steps
         loss.backward()
@@ -462,10 +427,7 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
             pearson = np.mean([pearsonr(x_target_abs[i].cpu().numpy(), x_pred_abs[i].cpu().numpy())[0]
                                for i in range(x_target_abs.size(0))])
             total_pearson += pearson
-            if pert_pred.shape[1] == pert.shape[1]:
-                pert_r2 = r2_score(pert.cpu().numpy(), pert_pred.cpu().numpy())
-            else:
-                pert_r2 = 0.0
+            pert_r2 = r2_score(pert.cpu().numpy(), pert_pred.cpu().numpy())
             total_pert_r2 += pert_r2
     return {
         'loss': total_loss / len(test_loader),
@@ -610,6 +572,40 @@ def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusio
           float_format=lambda x: '{:.6f}'.format(x)))
     print(f"\nModel and evaluation results saved to: {save_path}")
     return results
+def standardize_perturbation_encoding(train_dataset, test_dataset):
+    if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
+        if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
+            if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
+                return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+    train_pert_dim = train_dataset.perturbations.shape[1]
+    test_pert_dim = test_dataset.perturbations.shape[1]
+    max_pert_dim = max(train_pert_dim, test_pert_dim)
+    all_pert_names = set(train_dataset.perturbation_names +
+                         test_dataset.perturbation_names)
+    all_pert_names = sorted(list(all_pert_names))
+    train_pert_df = pd.DataFrame(train_dataset.adata.obs['perturbation'])
+    train_pert_encoded = pd.get_dummies(train_pert_df['perturbation'])
+    for pert_name in all_pert_names:
+        if pert_name not in train_pert_encoded.columns:
+            train_pert_encoded[pert_name] = 0
+    train_pert_encoded = train_pert_encoded.reindex(
+        columns=all_pert_names, fill_value=0)
+    train_dataset.perturbations = train_pert_encoded.values.astype(np.float32)
+    test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
+    test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
+    for pert_name in all_pert_names:
+        if pert_name not in test_pert_encoded.columns:
+            test_pert_encoded[pert_name] = 0
+    test_pert_encoded = test_pert_encoded.reindex(
+        columns=all_pert_names, fill_value=0)
+    test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+    actual_pert_dim = len(all_pert_names)
+    train_dataset._pert_encoding_standardized = True
+    test_dataset._pert_encoding_standardized = True
+    print_log(
+        f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
+    print_log(f"All perturbation types: {all_pert_names}")
+    return actual_pert_dim, all_pert_names
 def objective(trial, timestamp):
     global train_dataset, test_dataset, device, pca_model
     params = {
@@ -626,13 +622,14 @@ def objective(trial, timestamp):
         'pert_emb_dim': trial.suggest_int('pert_emb_dim', 32, 128),
         'diffusion_steps': trial.suggest_categorical('diffusion_steps', [500, 1000, 2000])
     }
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     base_model = ConditionalDiffusionModel(
         input_dim=n_genes,
         output_dim=n_genes,
-        train_pert_dim=train_dataset.perturbations.shape[1],
-        test_pert_dim=test_dataset.perturbations.shape[1],
+        train_pert_dim=pert_dim,
+        test_pert_dim=pert_dim,
         hidden_dim=params['n_hidden'],
         n_layers=params['n_layers'],
         n_heads=params['n_heads'],
@@ -706,10 +703,7 @@ def objective(trial, timestamp):
                 diffusion_loss = F.mse_loss(x_pred_abs, x_target_abs)
                 t_dummy = torch.randint(0, model.diffusion_steps, (x_baseline.shape[0],), device=device)
                 _, pert_pred, _ = model.model(x_pred_abs, pert, t_dummy, is_train=False)
-                if pert_pred.shape[1] == pert.shape[1]:
-                    pert_loss = F.mse_loss(pert_pred, pert)
-                else:
-                    pert_loss = torch.tensor(0.0, device=device)
+                pert_loss = F.mse_loss(pert_pred, pert)
                 loss = diffusion_loss + params['aux_weight'] * pert_loss
                 val_loss += loss.item()
                 val_batches_processed += 1
@@ -751,8 +745,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print('CUDA not available, using CPU')
     print('Loading ATAC data...')
-    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/LiscovitchBrauerSanjana2021_train.h5ad"
-    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/LiscovitchBrauerSanjana2021_test.h5ad"
+    train_path = "/datasets/LiscovitchBrauerSanjana2021_train.h5ad"
+    test_path = "/datasets/LiscovitchBrauerSanjana2021_test.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")
@@ -825,14 +819,15 @@ def main(gpu_id=None):
     print('Best parameters:')
     for key, value in study.best_params.items():
         print(f'{key}: {value}')
+    pert_dim = train_dataset.perturbations.shape[1]
     best_params = study.best_params
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     base_model = ConditionalDiffusionModel(
         input_dim=n_genes,
         output_dim=n_genes,
-        train_pert_dim=train_dataset.perturbations.shape[1],
-        test_pert_dim=test_dataset.perturbations.shape[1],
+        train_pert_dim=pert_dim,
+        test_pert_dim=pert_dim,
         hidden_dim=best_params['n_hidden'],
         n_layers=best_params['n_layers'],
         n_heads=best_params['n_heads'],

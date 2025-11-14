@@ -357,7 +357,10 @@ def train_model(model, train_loader, optimizer, scheduler, device,
                                        outputs['condition_mu'].pow(2) - 
                                        outputs['condition_logvar'].exp(), dim=1).mean()
         kl_loss = shared_kl + condition_kl
-        graph_loss = F.mse_loss(outputs['delta_expr'], outputs['regularized_expr'])
+        delta_expr = outputs['delta_expr']
+        delta_mean = delta_expr.mean(dim=1, keepdim=True)
+        laplacian_loss = torch.mean((delta_expr - delta_mean).pow(2).sum(dim=1))
+        graph_loss = laplacian_loss
         contrastive_loss = 0
         loss = recon_loss + aux_weight * kl_loss + ot_weight * graph_loss
         loss = loss / accumulation_steps
@@ -387,7 +390,10 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, contrastive_weigh
                                            outputs['condition_mu'].pow(2) - 
                                            outputs['condition_logvar'].exp(), dim=1).mean()
             kl_loss = shared_kl + condition_kl
-            graph_loss = F.mse_loss(outputs['delta_expr'], outputs['regularized_expr'])
+            delta_expr = outputs['delta_expr']
+            delta_mean = delta_expr.mean(dim=1, keepdim=True)
+            laplacian_loss = torch.mean((delta_expr - delta_mean).pow(2).sum(dim=1))
+            graph_loss = laplacian_loss
             contrastive_loss = 0
             loss = recon_loss + aux_weight * kl_loss + ot_weight * graph_loss
             total_loss += loss.item()
@@ -588,7 +594,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path,
         'scaler': scaler,
         'model_config': {
             'input_dim': model.input_dim,
-            'pert_dim': train_dataset.perturbations.shape[1],
+            'pert_dim': model.pert_dim,
             'time_dim': 3,
             'latent_dim': 128,
             'hidden_dim': 512,
@@ -605,6 +611,34 @@ def evaluate_and_save_model(model, test_loader, device, save_path,
     print(metrics_df.to_string(index=False, float_format=lambda x: '{:.6f}'.format(x)))
     print(f"\nModel and evaluation results saved to: {save_path}")
     return results
+def standardize_perturbation_encoding(train_dataset, test_dataset):
+    train_pert_dim = train_dataset.perturbations.shape[1]
+    test_pert_dim = test_dataset.perturbations.shape[1]
+    max_pert_dim = max(train_pert_dim, test_pert_dim)
+    all_pert_names = set(train_dataset.perturbation_names +
+                         test_dataset.perturbation_names)
+    all_pert_names = sorted(list(all_pert_names))
+    train_pert_df = pd.DataFrame(train_dataset.adata.obs['perturbation'])
+    train_pert_encoded = pd.get_dummies(train_pert_df['perturbation'])
+    for pert_name in all_pert_names:
+        if pert_name not in train_pert_encoded.columns:
+            train_pert_encoded[pert_name] = 0
+    train_pert_encoded = train_pert_encoded.reindex(
+        columns=all_pert_names, fill_value=0)
+    train_dataset.perturbations = train_pert_encoded.values.astype(np.float32)
+    test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
+    test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
+    for pert_name in all_pert_names:
+        if pert_name not in test_pert_encoded.columns:
+            test_pert_encoded[pert_name] = 0
+    test_pert_encoded = test_pert_encoded.reindex(
+        columns=all_pert_names, fill_value=0)
+    test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+    actual_pert_dim = len(all_pert_names)
+    print_log(
+        f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
+    print_log(f"All perturbation types: {all_pert_names}")
+    return actual_pert_dim, all_pert_names
 def main(gpu_id=None):
     global train_adata, train_dataset, test_dataset, device, pca_model, scaler
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -686,12 +720,13 @@ def main(gpu_id=None):
         is_train=False,
         common_genes_info=common_genes_info
     )
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = CytokineTrajectoryModel(
         input_dim=n_genes,
         output_dim=n_genes,  
-        pert_dim=train_dataset.perturbations.shape[1],
+        pert_dim=pert_dim,
         time_dim=3,
         latent_dim=128,
         hidden_dim=512,

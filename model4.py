@@ -69,6 +69,7 @@ class CITERNADataset(Dataset):
         self.n_genes = data.shape[1]
         self.pca = pca_model if pca_model is not None else None
         self.pca_dim = pca_dim if pca_model is not None else None
+        self.perturbation_names = list(adata.obs[perturbation_key].unique())
         self.perturbations = pd.get_dummies(adata.obs[perturbation_key]).values
         print(
             f"{'train' if is_train else 'test'} set perturbation dimension: {self.perturbations.shape[1]}")
@@ -400,6 +401,46 @@ def calculate_metrics(pred, true, control_baseline=None):
         'PCC_DE': pcc_de,
         'R2_DE': r2_de
     }
+def standardize_perturbation_encoding(train_dataset, test_dataset):
+    if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
+        if train_dataset._pert_encoding_standardized and test_dataset._pert_encoding_standardized:
+            if train_dataset.perturbations.shape[1] == test_dataset.perturbations.shape[1]:
+                return train_dataset.perturbations.shape[1], sorted(list(set(train_dataset.perturbation_names + test_dataset.perturbation_names)))
+    train_pert_dim = train_dataset.perturbations.shape[1]
+    test_pert_dim = test_dataset.perturbations.shape[1]
+    max_pert_dim = max(train_pert_dim, test_pert_dim)
+    all_pert_names = set(train_dataset.perturbation_names +
+                         test_dataset.perturbation_names)
+    all_pert_names = sorted(list(all_pert_names))
+    train_pert_df = pd.DataFrame(train_dataset.adata.obs['perturbation'])
+    train_pert_encoded = pd.get_dummies(train_pert_df['perturbation'])
+    for pert_name in all_pert_names:
+        if pert_name not in train_pert_encoded.columns:
+            train_pert_encoded[pert_name] = 0
+    train_pert_encoded = train_pert_encoded.reindex(
+        columns=all_pert_names, fill_value=0)
+    train_dataset.perturbations = train_pert_encoded.values.astype(np.float32)
+    for i, pair in enumerate(train_dataset.pairs):
+        pert_idx = pair['perturbed_idx']
+        train_dataset.pairs[i]['perturbation'] = train_dataset.perturbations[pert_idx]
+    test_pert_df = pd.DataFrame(test_dataset.adata.obs['perturbation'])
+    test_pert_encoded = pd.get_dummies(test_pert_df['perturbation'])
+    for pert_name in all_pert_names:
+        if pert_name not in test_pert_encoded.columns:
+            test_pert_encoded[pert_name] = 0
+    test_pert_encoded = test_pert_encoded.reindex(
+        columns=all_pert_names, fill_value=0)
+    test_dataset.perturbations = test_pert_encoded.values.astype(np.float32)
+    for i, pair in enumerate(test_dataset.pairs):
+        pert_idx = pair['perturbed_idx']
+        test_dataset.pairs[i]['perturbation'] = test_dataset.perturbations[pert_idx]
+    actual_pert_dim = len(all_pert_names)
+    train_dataset._pert_encoding_standardized = True
+    test_dataset._pert_encoding_standardized = True
+    print_log(
+        f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
+    print_log(f"All perturbation types: {all_pert_names}")
+    return actual_pert_dim, all_pert_names
 def objective(trial, timestamp):
     global train_dataset, test_dataset, device, pca_model
     params = {
@@ -417,12 +458,13 @@ def objective(trial, timestamp):
         'use_pert_emb': trial.suggest_categorical('use_pert_emb', [True, False]),
         'pert_emb_dim': trial.suggest_int('pert_emb_dim', 32, 128)
     }
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
     n_genes = train_dataset.n_genes
     print(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = CITERNATransformerModel(
         input_dim=n_genes,
         output_dim=n_genes,
-        pert_dim=train_dataset.perturbations.shape[1],
+        pert_dim=pert_dim,
         hidden_dim=params['n_hidden'],
         n_layers=params['n_layers'],
         n_heads=params['n_heads'],
@@ -533,7 +575,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
         'scaler': scaler,
         'model_config': {
             'input_dim': model.input_dim,
-            'pert_dim': train_dataset.perturbations.shape[1],
+            'pert_dim': model.pert_dim,
             'hidden_dim': getattr(model, 'hidden_dim', 512),
             'n_layers': getattr(model, 'n_layers', 3),
             'n_heads': getattr(model, 'n_heads', 8),
@@ -631,6 +673,7 @@ def main(gpu_id=None):
         is_train=False,
         common_genes_info=common_genes_info
     )
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42),
@@ -651,7 +694,7 @@ def main(gpu_id=None):
     final_model = CITERNATransformerModel(
         input_dim=n_genes,
         output_dim=n_genes,
-        pert_dim=train_dataset.perturbations.shape[1],
+        pert_dim=pert_dim,
         hidden_dim=best_params['n_hidden'],
         n_layers=best_params['n_layers'],
         n_heads=best_params['n_heads'],
