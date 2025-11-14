@@ -5,7 +5,7 @@ import numpy as np
 import scanpy as sc
 import scipy
 import anndata
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from tqdm import tqdm
@@ -207,12 +207,12 @@ class CytokineTrajectoryDataset(Dataset):
                 pert_target = pert
             else:
                 pert_target = self.perturbations[target_idx]
+        x_target_delta = x_target - x_baseline
         if self.augment and self.training:
             noise = np.random.normal(0, 0.05, x_baseline.shape)
             x_baseline = x_baseline + noise
             mask = np.random.random(x_baseline.shape) > 0.05
             x_baseline = x_baseline * mask
-        x_target_delta = x_target - x_baseline
         return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor(time_emb), torch.FloatTensor(x_target_delta)
 class TrajectoryAwareEncoder(nn.Module):
     def __init__(self, input_dim, latent_dim, hidden_dim, time_dim=3):
@@ -427,8 +427,8 @@ def train_model(model, train_loader, optimizer, scheduler, device,
 def evaluate_model(model, test_loader, device, aux_weight=0.1, contrastive_weight=0.05, ot_weight=0.01):
     model.eval()
     total_loss = 0
-    total_r2 = 0
-    total_pearson = 0
+    all_targets = []
+    all_predictions = []
     with torch.no_grad():
         for batch in test_loader:
             x_baseline, pert, time_emb, x_target_delta = batch
@@ -451,31 +451,31 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, contrastive_weigh
             total_loss += loss.item()
             x_target_abs = x_baseline + x_target_delta
             x_pred_abs = x_baseline + outputs['predicted_expr']
-            x_target_np = x_target_abs.cpu().numpy()
-            x_pred_np = x_pred_abs.cpu().numpy()
-            true_mean_overall = np.mean(x_target_np)
-            ss_res = np.sum((x_target_np - x_pred_np) ** 2)
-            ss_tot = np.sum((x_target_np - true_mean_overall) ** 2)
-            if ss_tot > 1e-10:
-                r2 = 1.0 - (ss_res / ss_tot)
-            else:
-                r2 = 0.0
-            if np.isnan(r2):
-                r2 = 0.0
-            total_r2 += r2
-            pred_flat = x_pred_np.flatten()
-            true_flat = x_target_np.flatten()
-            if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
-                pearson = pearsonr(true_flat, pred_flat)[0]
-                if np.isnan(pearson):
-                    pearson = 0.0
-            else:
-                pearson = 0.0
-            total_pearson += pearson
+            all_targets.append(x_target_abs.cpu().numpy())
+            all_predictions.append(x_pred_abs.cpu().numpy())
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_predictions = np.concatenate(all_predictions, axis=0)
+    true_mean_global = np.mean(all_targets)
+    ss_res = np.sum((all_targets - all_predictions) ** 2)
+    ss_tot = np.sum((all_targets - true_mean_global) ** 2)
+    if ss_tot > 1e-10:
+        r2 = 1.0 - (ss_res / ss_tot)
+    else:
+        r2 = 0.0
+    if np.isnan(r2):
+        r2 = 0.0
+    pred_flat = all_predictions.flatten()
+    true_flat = all_targets.flatten()
+    if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
+        pearson = pearsonr(true_flat, pred_flat)[0]
+        if np.isnan(pearson):
+            pearson = 0.0
+    else:
+        pearson = 0.0
     return {
         'loss': total_loss / len(test_loader),
-        'r2': total_r2 / len(test_loader),
-        'pearson': total_pearson / len(test_loader)
+        'r2': r2,
+        'pearson': pearson
     }
 def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None):
     n_samples, n_genes = true.shape
@@ -792,10 +792,20 @@ def main(gpu_id=None):
         use_optimal_transport=True,
         use_contrastive=True
     ).to(device)
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=64,
         shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=64,
+        shuffle=False,
         num_workers=4,
         pin_memory=True
     )
@@ -823,15 +833,15 @@ def main(gpu_id=None):
     max_epochs = 100
     for epoch in range(max_epochs):
         train_loss = train_model(model, train_loader, optimizer, scheduler, device)
-        eval_metrics = evaluate_model(model, test_loader, device)
+        val_metrics = evaluate_model(model, val_loader, device)
         if (epoch + 1) % 10 == 0:
             print_log(f'Epoch {epoch+1}/{max_epochs}:')
             print_log(f'Training Loss: {train_loss:.4f}')
-            print_log(f'Test Loss: {eval_metrics["loss"]:.4f}')
-            print_log(f'R2 Score: {eval_metrics["r2"]:.4f}')
-            print_log(f'Pearson Correlation: {eval_metrics["pearson"]:.4f}')
-        if eval_metrics["loss"] < best_loss:
-            best_loss = eval_metrics["loss"]
+            print_log(f'Validation Loss: {val_metrics["loss"]:.4f}')
+            print_log(f'Validation R2 Score: {val_metrics["r2"]:.4f}')
+            print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
+        if val_metrics["loss"] < best_loss:
+            best_loss = val_metrics["loss"]
             best_model = model.state_dict()
             torch.save({
                 'epoch': epoch,
@@ -839,11 +849,11 @@ def main(gpu_id=None):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
-                'metrics': eval_metrics
+                'metrics': val_metrics
             }, f'cytokines_best_model_{timestamp}.pt')
-            print_log(f"Saved best model with loss: {best_loss:.4f}")
+            print_log(f"Saved best model with validation loss: {best_loss:.4f}")
     model.load_state_dict(best_model)
-    print_log('Evaluating final model...')
+    print_log('Evaluating final model on test set...')
     results = evaluate_and_save_model(model, test_loader, device, 
                                     f'cytokines_final_model_{timestamp}.pt', 
                                     common_genes_info, pca_model, scaler)

@@ -207,13 +207,13 @@ class ControlPerturbedDataset(Dataset):
                 x_control = self.expression_data[0].copy()
             x_perturbed = self.expression_data[pair['perturbed_idx']]
             pert = pair['perturbation']
+        x_perturbed_original = self.original_expression_data[pair['perturbed_idx']]
+        x_target_delta = x_perturbed_original - x_control
         if self.augment and self.is_train:
             noise = np.random.normal(0, 0.05, x_control.shape)
             x_control = x_control + noise
             mask = np.random.random(x_control.shape) > 0.05
             x_control = x_control * mask
-        x_perturbed_original = self.original_expression_data[pair['perturbed_idx']]
-        x_target_delta = x_perturbed_original - x_control
         return (torch.FloatTensor(x_control),
                 torch.FloatTensor(pert),
                 torch.FloatTensor(x_target_delta))
@@ -426,8 +426,8 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
 def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max_pert_dim=None):
     model.eval()
     total_loss = 0
-    total_r2 = 0
-    total_pearson = 0
+    all_targets = []
+    all_predictions = []
     with torch.no_grad():
         for batch in test_loader:
             x_control, pert, x_target_delta = batch
@@ -444,15 +444,25 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
             total_loss += loss.item()
             x_target_abs = x_control + x_target_delta
             x_pred_abs = x_control + output
-            r2 = r2_score(x_target_abs.cpu().numpy(), x_pred_abs.cpu().numpy())
-            total_r2 += r2
-            pearson = np.mean([pearsonr(x_target_abs[i].cpu().numpy(), x_pred_abs[i].cpu().numpy())[0]
-                              for i in range(x_target_abs.size(0))])
-            total_pearson += pearson
+            all_targets.append(x_target_abs.cpu().numpy())
+            all_predictions.append(x_pred_abs.cpu().numpy())
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_predictions = np.concatenate(all_predictions, axis=0)
+    r2 = r2_score(all_targets, all_predictions)
+    if np.isnan(r2):
+        r2 = 0.0
+    pred_flat = all_predictions.flatten()
+    true_flat = all_targets.flatten()
+    if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
+        pearson = pearsonr(true_flat, pred_flat)[0]
+        if np.isnan(pearson):
+            pearson = 0.0
+    else:
+        pearson = 0.0
     return {
         'loss': total_loss / len(test_loader),
-        'r2': total_r2 / len(test_loader),
-        'pearson': total_pearson / len(test_loader)
+        'r2': r2,
+        'pearson': pearson
     }
 def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=None):
     if test_dataset is not None:
@@ -736,7 +746,11 @@ def main(gpu_id=None):
         weight_decay=best_params['weight_decay'],
         betas=(0.9, 0.999)
     )
-    train_loader = DataLoader(train_dataset, batch_size=best_params['batch_size'], shuffle=True)
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
+    train_loader = DataLoader(train_subset, batch_size=best_params['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_subset, batch_size=best_params['batch_size'], shuffle=False)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=best_params['learning_rate'],
@@ -748,28 +762,37 @@ def main(gpu_id=None):
     test_loader = DataLoader(test_dataset, batch_size=best_params['batch_size'], shuffle=False)
     print_log("Starting training...")
     best_loss = float('inf')
+    best_model = None
     for epoch in range(200):
         train_loss = train_model(model, train_loader, optimizer, scheduler, device,
                                 vae_beta=best_params['vae_beta'], max_pert_dim=pert_dim)
-        eval_metrics = evaluate_model(model, test_loader, device,
+        val_metrics = evaluate_model(model, val_loader, device,
                                       vae_beta=best_params['vae_beta'], max_pert_dim=pert_dim)
         print_log(f'Epoch {epoch+1}/200:')
         print_log(f'Train Loss: {train_loss:.4f}')
-        print_log(f'Test Loss: {eval_metrics["loss"]:.4f}')
-        print_log(f'R2 Score: {eval_metrics["r2"]:.4f}')
-        print_log(f'Pearson Correlation: {eval_metrics["pearson"]:.4f}')
-        if eval_metrics["loss"] < best_loss:
-            best_loss = eval_metrics["loss"]
+        print_log(f'Validation Loss: {val_metrics["loss"]:.4f}')
+        print_log(f'Validation R2 Score: {val_metrics["r2"]:.4f}')
+        print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
+        if val_metrics["loss"] < best_loss:
+            best_loss = val_metrics["loss"]
+            best_model = model.state_dict()
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
-                'metrics': eval_metrics,
+                'metrics': val_metrics,
                 'best_params': best_params
             }, f'model_best_{timestamp}.pt')
-            print_log(f"Saved best model, loss: {best_loss:.4f}")
+            print_log(f"Saved best model with validation loss: {best_loss:.4f}")
+    model.load_state_dict(best_model)
+    print_log('Evaluating final model on test set...')
+    test_metrics = evaluate_model(model, test_loader, device,
+                                  vae_beta=best_params['vae_beta'], max_pert_dim=pert_dim)
+    print_log(f'Final Test Loss: {test_metrics["loss"]:.4f}')
+    print_log(f'Final Test R2 Score: {test_metrics["r2"]:.4f}')
+    print_log(f'Final Test Pearson Correlation: {test_metrics["pearson"]:.4f}')
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Model: Control -> Perturbed Prediction')
     parser.add_argument('--gpu', type=int, default=None, help='GPU ID to use')

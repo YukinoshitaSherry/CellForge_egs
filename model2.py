@@ -244,6 +244,7 @@ class GeneExpressionDataset(Dataset):
             else:
                 pert_target = self.perturbations[target_idx]
                 dose_target = self.dose_values[target_idx]
+        x_target_delta = x_target - x_baseline
         if self.augment and self.training:
             noise = np.random.normal(0, 0.05, x_baseline.shape)
             x_baseline = x_baseline + noise
@@ -252,7 +253,6 @@ class GeneExpressionDataset(Dataset):
         x_baseline = x_baseline.astype(np.float32)
         pert_target = pert_target.astype(np.float32)
         dose_target = np.float32(dose_target)
-        x_target_delta = x_target - x_baseline
         if self.pca is not None:
             x_target_pca = self.pca.transform(x_target.reshape(1, -1)).flatten()
         else:
@@ -562,8 +562,8 @@ def train_model(model, train_loader, optimizer, scheduler, device, loss_weights=
 def evaluate_model(model, test_loader, device, loss_weights=None):
     model.eval()
     total_loss = 0
-    total_r2 = 0
-    total_pearson = 0
+    all_targets = []
+    all_predictions = []
     if loss_weights is None:
         loss_weights = {
             'recon': 1.0,
@@ -604,30 +604,37 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
             x_target_np = x_target_abs.cpu().numpy()
             x_pred_abs = x_baseline + outputs['x_pred']
             x_pred_np = x_pred_abs.cpu().numpy()
-            if np.any(np.isnan(x_target_np)) or np.any(np.isnan(x_pred_np)) or \
-               np.any(np.isinf(x_target_np)) or np.any(np.isinf(x_pred_np)):
+            if not (np.any(np.isnan(x_target_np)) or np.any(np.isnan(x_pred_np)) or \
+               np.any(np.isinf(x_target_np)) or np.any(np.isinf(x_pred_np))):
+                all_targets.append(x_target_np)
+                all_predictions.append(x_pred_np)
+    if len(all_targets) > 0:
+        all_targets = np.concatenate(all_targets, axis=0)
+        all_predictions = np.concatenate(all_predictions, axis=0)
+        try:
+            r2 = r2_score(all_targets, all_predictions)
+            if np.isnan(r2):
                 r2 = 0.0
-                pearson = 0.0
-            else:
-                try:
-                    r2 = r2_score(x_target_np, x_pred_np)
-                    if np.isnan(r2):
-                        r2 = 0.0
-                except:
-                    r2 = 0.0
-                try:
-                    pearson = np.mean([pearsonr(x_target_abs[i].cpu().numpy(), x_pred_abs[i].cpu().numpy())[0]
-                                       for i in range(x_target_abs.size(0))])
-                    if np.isnan(pearson):
-                        pearson = 0.0
-                except:
+        except:
+            r2 = 0.0
+        try:
+            pred_flat = all_predictions.flatten()
+            true_flat = all_targets.flatten()
+            if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
+                pearson = pearsonr(true_flat, pred_flat)[0]
+                if np.isnan(pearson):
                     pearson = 0.0
-            total_r2 += r2
-            total_pearson += pearson
+            else:
+                pearson = 0.0
+        except:
+            pearson = 0.0
+    else:
+        r2 = 0.0
+        pearson = 0.0
     return {
         'loss': total_loss / len(test_loader),
-        'r2': total_r2 / len(test_loader),
-        'pearson': total_pearson / len(test_loader)
+        'r2': r2,
+        'pearson': pearson
     }
 def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None):
     n_samples, n_genes = true.shape
@@ -1189,10 +1196,20 @@ def main(gpu_id=None):
         ot_max_iter=best_params['ot_max_iter'],
         flow_layers=best_params['flow_layers']
     ).to(device)
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=best_params['batch_size'],
         shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=best_params['batch_size'],
+        shuffle=False,
         num_workers=4,
         pin_memory=True
     )
@@ -1226,16 +1243,16 @@ def main(gpu_id=None):
     for epoch in range(max_epochs):
         train_loss = train_model(
             final_model, train_loader, optimizer, scheduler, device, loss_weights)
-        eval_metrics = evaluate_model(
-            final_model, test_loader, device, loss_weights)
+        val_metrics = evaluate_model(
+            final_model, val_loader, device, loss_weights)
         if (epoch + 1) % 20 == 0:
             print_log(f'Epoch {epoch+1}/{max_epochs}:')
             print_log(f'Training Loss: {train_loss:.4f}')
-            print_log(f'Test Loss: {eval_metrics["loss"]:.4f}')
-            print_log(f'R2 Score: {eval_metrics["r2"]:.4f}')
-            print_log(f'Pearson Correlation: {eval_metrics["pearson"]:.4f}')
-        if eval_metrics["loss"] < best_loss:
-            best_loss = eval_metrics["loss"]
+            print_log(f'Validation Loss: {val_metrics["loss"]:.4f}')
+            print_log(f'Validation R2 Score: {val_metrics["r2"]:.4f}')
+            print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
+        if val_metrics["loss"] < best_loss:
+            best_loss = val_metrics["loss"]
             best_model = final_model.state_dict()
             torch.save({
                 'epoch': epoch,
@@ -1243,12 +1260,12 @@ def main(gpu_id=None):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
-                'metrics': eval_metrics,
+                'metrics': val_metrics,
                 'best_params': best_params
             }, f'condot_grn_best_model_{timestamp}.pt')
-            print_log(f"Saved best model with loss: {best_loss:.4f}")
+            print_log(f"Saved best model with validation loss: {best_loss:.4f}")
     final_model.load_state_dict(best_model)
-    print_log('Evaluating final model...')
+    print_log('Evaluating final model on test set...')
     results = evaluate_and_save_model(
         final_model, test_loader, device,
         f'condot_grn_final_model_{timestamp}.pt',
