@@ -18,8 +18,16 @@ import time
 from datetime import datetime
 import argparse
 import math
+import random
 def print_log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+
+def set_global_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 train_adata = None
 train_dataset = None
 test_dataset = None
@@ -54,13 +62,28 @@ class CytokineTrajectoryDataset(Dataset):
                 data = adata.X
         data = np.maximum(data, 0)
         data = np.maximum(data, 1e-10)
-        data = np.log1p(data)
+        data_mean_before = np.mean(data)
+        data_std_before = np.std(data)
+        data_max_before = np.max(data)
+        data_min_before = np.min(data)
+        is_log1p_already = (data_max_before < 20.0 and data_min_before >= 0.0)
+        is_standardized_already = (abs(data_mean_before) < 0.5 and 0.5 < data_std_before < 2.0)
+        if not is_log1p_already:
+            data = np.log1p(data)
         if scaler is None:
-            self.scaler = StandardScaler()
-            data = self.scaler.fit_transform(data)
+            if is_standardized_already:
+                self.scaler = StandardScaler()
+                self.scaler.mean_ = np.zeros(data.shape[1])
+                self.scaler.scale_ = np.ones(data.shape[1])
+                self.scaler.var_ = np.ones(data.shape[1])
+                self.scaler.n_features_in_ = data.shape[1]
+            else:
+                self.scaler = StandardScaler()
+                data = self.scaler.fit_transform(data)
         else:
             self.scaler = scaler
-            data = self.scaler.transform(data)
+            if not is_standardized_already:
+                data = self.scaler.transform(data)
         data = np.clip(data, -10, 10)
         data = data / 10.0
         self.original_expression_data = data.copy()
@@ -96,8 +119,11 @@ class CytokineTrajectoryDataset(Dataset):
                     "For unseen perturbation prediction, test set should use training set control baseline. "
                     "Please ensure training set has control samples."
                 )
+        self.rng = np.random.RandomState(42)
         self.time_embeddings = self._encode_timepoints(adata.obs[age_key])
         print_log(f"{'Training' if is_train else 'Test'} set time dimension: {self.time_embeddings.shape[1]}")
+        if not self.is_train:
+            self._create_fixed_pairs_for_test()
     def _encode_timepoints(self, timepoints):
         time_mapping = {}
         unique_times = sorted(timepoints.unique())
@@ -119,44 +145,68 @@ class CytokineTrajectoryDataset(Dataset):
             norm_time = time_val / 20.0
             time_features.append([sin_time, cos_time, norm_time])
         return np.array(time_features)
+    def _create_fixed_pairs_for_test(self):
+        n = len(self.adata)
+        self.pairs = [None] * n
+        for idx in range(n):
+            if idx in self._control_indices:
+                baseline_idx = idx
+                if len(self._non_control_pert_names) > 0 and len(self._non_control_indices) > 0:
+                    target_idx = int(self._non_control_indices[idx % len(self._non_control_indices)])
+                else:
+                    alternative_controls = self._control_indices[self._control_indices != idx]
+                    if len(alternative_controls) > 0:
+                        target_idx = int(alternative_controls[idx % len(alternative_controls)])
+                    else:
+                        target_idx = idx
+            else:
+                if len(self._control_indices) > 0:
+                    baseline_idx = int(self._control_indices[idx % len(self._control_indices)])
+                else:
+                    baseline_idx = idx
+                target_idx = idx
+            self.pairs[idx] = (baseline_idx, target_idx)
     def __len__(self):
         return len(self.adata)
     def __getitem__(self, idx):
         x_current = self.expression_data[idx]
         pert = self.perturbations[idx]
         time_emb = self.time_embeddings[idx]
-        if idx in self._control_indices:
-            x_baseline = x_current
-            if len(self._non_control_pert_names) > 0 and len(self._non_control_indices) > 0:
-                if self.is_train:
-                    target_idx = int(np.random.choice(self._non_control_indices))
-                else:
-                    target_idx = int(self._non_control_indices[idx % len(self._non_control_indices)])
-                x_target = self.original_expression_data[target_idx]
-                pert_target = self.perturbations[target_idx]
-            else:
-                alternative_controls = self._control_indices[self._control_indices != idx]
-                if len(alternative_controls) > 0:
-                    if self.is_train:
-                        target_idx = int(np.random.choice(alternative_controls))
-                    else:
-                        target_idx = int(alternative_controls[idx % len(alternative_controls)])
+        if self.is_train:
+            if idx in self._control_indices:
+                x_baseline = x_current
+                if len(self._non_control_pert_names) > 0 and len(self._non_control_indices) > 0:
+                    target_idx = int(self.rng.choice(self._non_control_indices))
                     x_target = self.original_expression_data[target_idx]
                     pert_target = self.perturbations[target_idx]
                 else:
-                    x_target = self.original_expression_data[idx]
-                    pert_target = pert
-        else:
-            if len(self._control_indices) > 0:
-                if self.is_train:
-                    baseline_idx = int(np.random.choice(self._control_indices))
-                else:
-                    baseline_idx = int(self._control_indices[idx % len(self._control_indices)])
-                x_baseline = self.expression_data[baseline_idx]
+                    alternative_controls = self._control_indices[self._control_indices != idx]
+                    if len(alternative_controls) > 0:
+                        target_idx = int(self.rng.choice(alternative_controls))
+                        x_target = self.original_expression_data[target_idx]
+                        pert_target = self.perturbations[target_idx]
+                    else:
+                        x_target = self.original_expression_data[idx]
+                        pert_target = pert
             else:
+                if len(self._control_indices) > 0:
+                    baseline_idx = int(self.rng.choice(self._control_indices))
+                    x_baseline = self.expression_data[baseline_idx]
+                else:
+                    x_baseline = x_current
+                x_target = self.original_expression_data[idx]
+                pert_target = pert
+        else:
+            baseline_idx, target_idx = self.pairs[idx]
+            if baseline_idx == idx and idx in self._control_indices:
                 x_baseline = x_current
-            x_target = self.original_expression_data[idx]
-            pert_target = pert
+            else:
+                x_baseline = self.expression_data[baseline_idx]
+            x_target = self.original_expression_data[target_idx]
+            if target_idx == idx:
+                pert_target = pert
+            else:
+                pert_target = self.perturbations[target_idx]
         if self.augment and self.training:
             noise = np.random.normal(0, 0.05, x_baseline.shape)
             x_baseline = x_baseline + noise
@@ -648,6 +698,7 @@ def standardize_perturbation_encoding(train_dataset, test_dataset):
     print_log(f"All perturbation types: {all_pert_names}")
     return actual_pert_dim, all_pert_names
 def main(gpu_id=None):
+    set_global_seed(42)
     global train_adata, train_dataset, test_dataset, device, pca_model, scaler
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print_log(f'Training started at: {timestamp}')
@@ -669,8 +720,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/SchiebingerLander2019_train_processed.h5ad"
-    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/SchiebingerLander2019_test_processed.h5ad"
+    train_path = "/datasets/SchiebingerLander2019_train_processed.h5ad"
+    test_path = "/datasets/SchiebingerLander2019_test_processed.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)

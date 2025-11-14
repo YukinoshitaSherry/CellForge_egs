@@ -19,9 +19,17 @@ from datetime import datetime
 import argparse
 import warnings
 from typing import Dict, List, Tuple, Optional, Union
+import random
 warnings.filterwarnings('ignore')
 def print_log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+
+def set_global_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 train_adata = None
 test_adata = None
 train_dataset = None
@@ -57,13 +65,28 @@ class ControlPerturbedDataset(Dataset):
                 data = adata.X
         data = np.maximum(data, 0)
         data = np.maximum(data, 1e-10)
-        data = np.log1p(data)
+        data_mean_before = np.mean(data)
+        data_std_before = np.std(data)
+        data_max_before = np.max(data)
+        data_min_before = np.min(data)
+        is_log1p_already = (data_max_before < 20.0 and data_min_before >= 0.0)
+        is_standardized_already = (abs(data_mean_before) < 0.5 and 0.5 < data_std_before < 2.0)
+        if not is_log1p_already:
+            data = np.log1p(data)
         if scaler is None:
-            self.scaler = StandardScaler()
-            data = self.scaler.fit_transform(data)
+            if is_standardized_already:
+                self.scaler = StandardScaler()
+                self.scaler.mean_ = np.zeros(data.shape[1])
+                self.scaler.scale_ = np.ones(data.shape[1])
+                self.scaler.var_ = np.ones(data.shape[1])
+                self.scaler.n_features_in_ = data.shape[1]
+            else:
+                self.scaler = StandardScaler()
+                data = self.scaler.fit_transform(data)
         else:
             self.scaler = scaler
-            data = self.scaler.transform(data)
+            if not is_standardized_already:
+                data = self.scaler.transform(data)
         data = np.clip(data, -10, 10)
         data = data / 10.0
         self.original_expression_data = data.copy()
@@ -120,34 +143,45 @@ class ControlPerturbedDataset(Dataset):
             self.use_avg_baseline = False
             self.avg_baseline = None
         self.pairs = []
-        np.random.seed(42 if self.is_train else 123)
-        for perturbed_idx in perturbed_indices:
+        for i, perturbed_idx in enumerate(perturbed_indices):
             if self.use_avg_baseline:
                 baseline_idx = -1
             else:
                 available_controls = control_indices[control_indices != perturbed_idx]
                 if len(available_controls) > 0:
-                    baseline_idx = np.random.choice(available_controls)
+                    if self.is_train:
+                        baseline_idx = np.random.choice(available_controls)
+                    else:
+                        baseline_idx = available_controls[i % len(available_controls)]
                 else:
-                    baseline_idx = np.random.choice(control_indices)
+                    if self.is_train:
+                        baseline_idx = np.random.choice(control_indices)
+                    else:
+                        baseline_idx = control_indices[i % len(control_indices)]
             self.pairs.append({
                 'baseline_idx': baseline_idx,
                 'perturbed_idx': perturbed_idx,
                 'perturbation': self.perturbations[perturbed_idx]
             })
         if len(control_indices) > 0 and len(perturbed_indices) > 0:
-            for control_idx in control_indices:
-                target_idx = np.random.choice(perturbed_indices)
+            for i, control_idx in enumerate(control_indices):
+                if self.is_train:
+                    target_idx = np.random.choice(perturbed_indices)
+                else:
+                    target_idx = perturbed_indices[i % len(perturbed_indices)]
                 self.pairs.append({
                     'baseline_idx': control_idx,
                     'perturbed_idx': target_idx,
                     'perturbation': self.perturbations[target_idx]
                 })
         elif len(control_indices) > 1:
-            for control_idx in control_indices:
+            for i, control_idx in enumerate(control_indices):
                 other_controls = control_indices[control_indices != control_idx]
                 if len(other_controls) > 0:
-                    baseline_idx = np.random.choice(other_controls)
+                    if self.is_train:
+                        baseline_idx = np.random.choice(other_controls)
+                    else:
+                        baseline_idx = other_controls[i % len(other_controls)]
                     self.pairs.append({
                         'baseline_idx': baseline_idx,
                         'perturbed_idx': control_idx,
@@ -554,6 +588,7 @@ def objective(trial):
                 break
     return best_val_loss
 def main(gpu_id=None):
+    set_global_seed(42)
     global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler, common_genes_info
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print_log(f'Training started at: {timestamp}')
@@ -575,8 +610,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
-    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
+    train_path = "/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
+    test_path = "/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)
