@@ -1232,6 +1232,8 @@ def main(gpu_id=None):
     best_loss = float('inf')
     best_model = None
     max_epochs = 200
+    patience = 20
+    patience_counter = 0
     loss_weights = {
         'recon': best_params['alpha'],
         'ot': best_params['beta'],
@@ -1253,6 +1255,7 @@ def main(gpu_id=None):
             print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
+            patience_counter = 0
             best_model = final_model.state_dict()
             torch.save({
                 'epoch': epoch,
@@ -1264,6 +1267,11 @@ def main(gpu_id=None):
                 'best_params': best_params
             }, f'condot_grn_best_model_{timestamp}.pt')
             print_log(f"Saved best model with validation loss: {best_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print_log(f'Early stopping at epoch {epoch+1}')
+                break
     final_model.load_state_dict(best_model)
     print_log('Evaluating final model on test set...')
     results = evaluate_and_save_model(

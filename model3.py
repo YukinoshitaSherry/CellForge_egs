@@ -720,8 +720,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/datasets/SchiebingerLander2019_train_processed.h5ad"
-    test_path = "/datasets/SchiebingerLander2019_test_processed.h5ad"
+    train_path = "/datasets/SchiebingerLander2019_train_processed_filtered2.h5ad"
+    test_path = "/datasets/SchiebingerLander2019_test_processed_filtered2.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)
@@ -831,6 +831,8 @@ def main(gpu_id=None):
     best_loss = float('inf')
     best_model = None
     max_epochs = 100
+    patience = 15
+    patience_counter = 0
     for epoch in range(max_epochs):
         train_loss = train_model(model, train_loader, optimizer, scheduler, device)
         val_metrics = evaluate_model(model, val_loader, device)
@@ -842,6 +844,7 @@ def main(gpu_id=None):
             print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
+            patience_counter = 0
             best_model = model.state_dict()
             torch.save({
                 'epoch': epoch,
@@ -852,6 +855,11 @@ def main(gpu_id=None):
                 'metrics': val_metrics
             }, f'cytokines_best_model_{timestamp}.pt')
             print_log(f"Saved best model with validation loss: {best_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print_log(f'Early stopping at epoch {epoch+1}')
+                break
     model.load_state_dict(best_model)
     print_log('Evaluating final model on test set...')
     results = evaluate_and_save_model(model, test_loader, device, 

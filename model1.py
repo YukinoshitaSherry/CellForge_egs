@@ -423,11 +423,123 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
         scheduler.step()
         total_loss += loss.item()
     return total_loss / len(train_loader)
+def calculate_detailed_metrics(pred, true, control_baseline=None):
+    """Calculate detailed metrics including DE metrics"""
+    n_samples, n_genes = true.shape
+    mse = np.mean((pred - true) ** 2)
+    true_mean_per_gene = np.mean(true, axis=0)
+    pred_mean_per_gene = np.mean(pred, axis=0)
+    true_centered = true - true_mean_per_gene
+    pred_centered = pred - pred_mean_per_gene
+    numerator = np.sum(true_centered * pred_centered)
+    true_norm = np.sqrt(np.sum(true_centered ** 2))
+    pred_norm = np.sqrt(np.sum(pred_centered ** 2))
+    if true_norm > 1e-10 and pred_norm > 1e-10:
+        pcc = numerator / (true_norm * pred_norm)
+        if np.isnan(pcc):
+            pcc = 0.0
+    else:
+        pcc = 0.0
+    true_mean_vector = np.mean(true, axis=0)
+    ss_res = np.sum((true - pred) ** 2)
+    ss_tot = np.sum((true - true_mean_vector) ** 2)
+    if ss_tot > 1e-10:
+        r2 = 1.0 - (ss_res / ss_tot)
+    else:
+        r2 = 0.0
+    if np.isnan(r2):
+        r2 = 0.0
+    
+    # Calculate DE metrics
+    if control_baseline is not None and control_baseline.shape[0] > 0:
+        epsilon = 1e-8
+        true_mean_pert = np.mean(true, axis=0)
+        control_mean = np.mean(control_baseline, axis=0)
+        lfc = np.log2((true_mean_pert + epsilon) / (control_mean + epsilon))
+        lfc_abs = np.abs(lfc)
+        K = min(20, n_genes)
+        top_k_indices = np.argsort(lfc_abs)[-K:]
+        de_mask = np.zeros(n_genes, dtype=bool)
+        de_mask[top_k_indices] = True
+        if np.any(de_mask):
+            mse_de = np.mean((pred[:, de_mask] - true[:, de_mask]) ** 2)
+            true_de = true[:, de_mask]
+            pred_de = pred[:, de_mask]
+            true_de_mean_per_gene = np.mean(true_de, axis=0)
+            pred_de_mean_per_gene = np.mean(pred_de, axis=0)
+            true_de_centered = true_de - true_de_mean_per_gene
+            pred_de_centered = pred_de - pred_de_mean_per_gene
+            numerator_de = np.sum(true_de_centered * pred_de_centered)
+            true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
+            pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
+            if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
+                pcc_de = numerator_de / (true_de_norm * pred_de_norm)
+                if np.isnan(pcc_de):
+                    pcc_de = 0.0
+            else:
+                pcc_de = 0.0
+            true_de_mean_vector = np.mean(true_de, axis=0)
+            ss_res_de = np.sum((true_de - pred_de) ** 2)
+            ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
+            if ss_tot_de > 1e-10:
+                r2_de = 1.0 - (ss_res_de / ss_tot_de)
+            else:
+                r2_de = 0.0
+            if np.isnan(r2_de):
+                r2_de = 0.0
+        else:
+            mse_de = pcc_de = r2_de = np.nan
+    else:
+        std = np.std(true, axis=0)
+        de_mask = np.abs(true - np.mean(true, axis=0)) > std
+        if np.any(de_mask):
+            de_genes_indices = np.where(np.any(de_mask, axis=0))[0]
+            if len(de_genes_indices) > 0:
+                true_de = true[:, de_genes_indices]
+                pred_de = pred[:, de_genes_indices]
+                mse_de = np.mean((pred_de - true_de) ** 2)
+                true_de_mean_per_gene = np.mean(true_de, axis=0)
+                pred_de_mean_per_gene = np.mean(pred_de, axis=0)
+                true_de_centered = true_de - true_de_mean_per_gene
+                pred_de_centered = pred_de - pred_de_mean_per_gene
+                numerator_de = np.sum(true_de_centered * pred_de_centered)
+                true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
+                pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
+                if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
+                    pcc_de = numerator_de / (true_de_norm * pred_de_norm)
+                    if np.isnan(pcc_de):
+                        pcc_de = 0.0
+                else:
+                    pcc_de = 0.0
+                true_de_mean_vector = np.mean(true_de, axis=0)
+                ss_res_de = np.sum((true_de - pred_de) ** 2)
+                ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
+                if ss_tot_de > 1e-10:
+                    r2_de = 1.0 - (ss_res_de / ss_tot_de)
+                else:
+                    r2_de = 0.0
+                if np.isnan(r2_de):
+                    r2_de = 0.0
+            else:
+                mse_de = pcc_de = r2_de = np.nan
+        else:
+            mse_de = pcc_de = r2_de = np.nan
+    
+    return {
+        'MSE': mse,
+        'PCC': pcc,
+        'R2': r2,
+        'MSE_DE': mse_de,
+        'PCC_DE': pcc_de,
+        'R2_DE': r2_de
+    }
+
 def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max_pert_dim=None):
     model.eval()
     total_loss = 0
     all_targets = []
     all_predictions = []
+    all_controls = []
     with torch.no_grad():
         for batch in test_loader:
             x_control, pert, x_target_delta = batch
@@ -446,8 +558,12 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
             x_pred_abs = x_control + output
             all_targets.append(x_target_abs.cpu().numpy())
             all_predictions.append(x_pred_abs.cpu().numpy())
+            all_controls.append(x_control.cpu().numpy())
     all_targets = np.concatenate(all_targets, axis=0)
     all_predictions = np.concatenate(all_predictions, axis=0)
+    all_controls = np.concatenate(all_controls, axis=0)
+    
+    # Calculate basic metrics
     r2 = r2_score(all_targets, all_predictions)
     if np.isnan(r2):
         r2 = 0.0
@@ -459,10 +575,21 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
             pearson = 0.0
     else:
         pearson = 0.0
+    
+    # Calculate detailed metrics including DE
+    control_baseline = all_controls if len(all_controls) > 0 else None
+    detailed_metrics = calculate_detailed_metrics(all_predictions, all_targets, control_baseline=control_baseline)
+    
     return {
         'loss': total_loss / len(test_loader),
         'r2': r2,
-        'pearson': pearson
+        'pearson': pearson,
+        'MSE': detailed_metrics['MSE'],
+        'PCC': detailed_metrics['PCC'],
+        'R2': detailed_metrics['R2'],
+        'MSE_DE': detailed_metrics['MSE_DE'],
+        'PCC_DE': detailed_metrics['PCC_DE'],
+        'R2_DE': detailed_metrics['R2_DE']
     }
 def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=None):
     if test_dataset is not None:
@@ -763,6 +890,9 @@ def main(gpu_id=None):
     print_log("Starting training...")
     best_loss = float('inf')
     best_model = None
+    best_epoch = 0
+    patience = 20
+    patience_counter = 0
     for epoch in range(200):
         train_loss = train_model(model, train_loader, optimizer, scheduler, device,
                                 vae_beta=best_params['vae_beta'], max_pert_dim=pert_dim)
@@ -775,6 +905,8 @@ def main(gpu_id=None):
         print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
+            best_epoch = epoch
+            patience_counter = 0
             best_model = model.state_dict()
             torch.save({
                 'epoch': epoch,
@@ -786,13 +918,44 @@ def main(gpu_id=None):
                 'best_params': best_params
             }, f'model_best_{timestamp}.pt')
             print_log(f"Saved best model with validation loss: {best_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print_log(f'Early stopping at epoch {epoch+1}')
+                break
     model.load_state_dict(best_model)
     print_log('Evaluating final model on test set...')
     test_metrics = evaluate_model(model, test_loader, device,
                                   vae_beta=best_params['vae_beta'], max_pert_dim=pert_dim)
-    print_log(f'Final Test Loss: {test_metrics["loss"]:.4f}')
-    print_log(f'Final Test R2 Score: {test_metrics["r2"]:.4f}')
-    print_log(f'Final Test Pearson Correlation: {test_metrics["pearson"]:.4f}')
+    
+    # Save evaluation results to CSV
+    results_df = pd.DataFrame({
+        'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
+        'Value': [
+            test_metrics["MSE"],
+            test_metrics["PCC"],
+            test_metrics["R2"],
+            test_metrics["MSE_DE"],
+            test_metrics["PCC_DE"],
+            test_metrics["R2_DE"]
+        ]
+    })
+    results_df.to_csv(f'norman_weissman_evaluation_results_{timestamp}.csv', index=False)
+    print_log("\nFinal Evaluation Results:")
+    print_log(results_df.to_string(index=False, float_format=lambda x: '{:.6f}'.format(x)))
+    
+    # Also save final model with evaluation results
+    torch.save({
+        'epoch': best_epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'loss': test_metrics["loss"],
+        'metrics': test_metrics,
+        'best_params': best_params,
+        'evaluation_results': test_metrics
+    }, f'model_final_{timestamp}.pt')
+    print_log(f"Final model with evaluation results saved to: model_final_{timestamp}.pt")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Model: Control -> Perturbed Prediction')
     parser.add_argument('--gpu', type=int, default=None, help='GPU ID to use')

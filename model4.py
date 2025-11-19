@@ -675,8 +675,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print('CUDA not available, using CPU')
     print('Loading CITE-seq RNA data...')
-    train_path = "/datasets/PapalexiSatija2021_eccite_RNA_train.h5ad"
-    test_path = "/datasets/PapalexiSatija2021_eccite_RNA_test.h5ad"
+    train_path = "/datasets/PapalexiSatija2021_eccite_RNA_train_filtered2.h5ad"
+    test_path = "/datasets/PapalexiSatija2021_eccite_RNA_test_filtered2.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")
@@ -802,6 +802,8 @@ def main(gpu_id=None):
     best_loss = float('inf')
     best_model = None
     max_epochs = 200
+    patience = 20
+    patience_counter = 0
     for epoch in range(max_epochs):
         train_loss = train_model(final_model, train_loader, optimizer, scheduler, device,
                                  aux_weight=best_params['aux_weight'])
@@ -816,6 +818,7 @@ def main(gpu_id=None):
             print(f'Validation Perturbation R2: {val_metrics["pert_r2"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
+            patience_counter = 0
             best_model = final_model.state_dict()
             torch.save({
                 'epoch': epoch,
@@ -827,6 +830,11 @@ def main(gpu_id=None):
                 'best_params': best_params
             }, f'cite_rna_best_model_{timestamp}.pt')
             print(f"Saved best RNA model with validation loss: {best_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'Early stopping at epoch {epoch+1}')
+                break
     final_model.load_state_dict(best_model)
     print('Evaluating final RNA model on test set...')
     results = evaluate_and_save_model(final_model, test_loader, device,
