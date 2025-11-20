@@ -554,7 +554,7 @@ def calculate_detailed_metrics(pred, true, control_baseline=None, perturbations=
         'R2_DE': r2_de
     }
 
-def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max_pert_dim=None):
+def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max_pert_dim=None, test_dataset=None):
     model.eval()
     total_loss = 0
     all_targets = []
@@ -600,7 +600,16 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
         pearson = 0.0
     
     
-    control_baseline = all_controls if len(all_controls) > 0 else None
+    if test_dataset is not None and hasattr(test_dataset, 'control_baseline') and test_dataset.control_baseline is not None and not (hasattr(test_dataset, 'use_avg_baseline') and test_dataset.use_avg_baseline):
+        control_baseline = test_dataset.control_baseline.reshape(1, -1) if test_dataset.control_baseline.ndim == 1 else test_dataset.control_baseline
+    elif test_dataset is not None and hasattr(test_dataset, 'use_avg_baseline') and test_dataset.use_avg_baseline:
+        control_baseline = None
+    else:
+        unique_controls = np.unique(all_controls, axis=0)
+        if len(unique_controls) > 0:
+            control_baseline = all_controls if len(all_controls) > 0 else None
+        else:
+            control_baseline = None
     detailed_metrics = calculate_detailed_metrics(all_predictions, all_targets, control_baseline=control_baseline, perturbations=all_perts)
     
     return {
@@ -768,8 +777,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
     print_log('Loading data...')
-    train_path = "/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
-    test_path = "/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
+    train_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_train_processed_unseenpert1.h5ad"
+    test_path = "/disk/disk_20T/yzy/split_new_done/datasets/NormanWeissman2019_filtered_test_processed_unseenpert1.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)
@@ -945,7 +954,7 @@ def main(gpu_id=None):
     model.load_state_dict(best_model)
     print_log('Evaluating final model on test set...')
     test_metrics = evaluate_model(model, test_loader, device,
-                                  vae_beta=best_params['vae_beta'], max_pert_dim=pert_dim)
+                                  vae_beta=best_params['vae_beta'], max_pert_dim=pert_dim, test_dataset=test_dataset)
     
     
     
