@@ -14,6 +14,7 @@ import pandas as pd
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
 import optuna
+import optuna.logging
 import time
 from datetime import datetime
 import argparse
@@ -450,7 +451,7 @@ def calculate_detailed_metrics(pred, true, control_baseline=None):
     if np.isnan(r2):
         r2 = 0.0
     
-    # Calculate DE metrics
+    
     if control_baseline is not None and control_baseline.shape[0] > 0:
         epsilon = 1e-8
         true_mean_pert = np.mean(true, axis=0)
@@ -563,7 +564,7 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_controls = np.concatenate(all_controls, axis=0)
     
-    # Calculate basic metrics
+    
     r2 = r2_score(all_targets, all_predictions)
     if np.isnan(r2):
         r2 = 0.0
@@ -576,7 +577,7 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
     else:
         pearson = 0.0
     
-    # Calculate detailed metrics including DE
+    
     control_baseline = all_controls if len(all_controls) > 0 else None
     detailed_metrics = calculate_detailed_metrics(all_predictions, all_targets, control_baseline=control_baseline)
     
@@ -732,17 +733,15 @@ def main(gpu_id=None):
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         print_log(f'Available GPUs: {gpu_count}')
-        for i in range(gpu_count):
-            print_log(f'GPU {i}: {torch.cuda.get_device_name(i)}')
         if gpu_id is not None:
             if gpu_id >= gpu_count:
                 print_log(f'Warning: Specified GPU {gpu_id} does not exist, using GPU 0')
                 gpu_id = 0
             device = torch.device(f'cuda:{gpu_id}')
-            print_log(f'Using specified GPU {gpu_id}: {device}')
+            print_log(f'Using GPU {gpu_id}: {device}')
         else:
             device = torch.device('cuda:0')
-            print_log(f'Using default GPU 0: {device}')
+            print_log(f'Using GPU 0: {device}')
     else:
         device = torch.device('cpu')
         print_log('CUDA not available, using CPU')
@@ -809,14 +808,14 @@ def main(gpu_id=None):
         common_genes_info=common_genes_info,
         train_control_baseline=train_control_baseline
     )
+    
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     print_log("Starting hyperparameter optimization...")
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42)
     )
     study.optimize(objective, n_trials=50, show_progress_bar=True)
-    print_log(f'Best parameters: {study.best_params}')
-    print_log(f'Best loss: {study.best_value}')
     best_params = study.best_params
     print_log("Training final model with best parameters...")
     pca_model = None
@@ -901,8 +900,6 @@ def main(gpu_id=None):
         print_log(f'Epoch {epoch+1}/200:')
         print_log(f'Train Loss: {train_loss:.4f}')
         print_log(f'Validation Loss: {val_metrics["loss"]:.4f}')
-        print_log(f'Validation R2 Score: {val_metrics["r2"]:.4f}')
-        print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
             best_epoch = epoch
@@ -928,7 +925,11 @@ def main(gpu_id=None):
     test_metrics = evaluate_model(model, test_loader, device,
                                   vae_beta=best_params['vae_beta'], max_pert_dim=pert_dim)
     
-    # Save evaluation results to CSV
+    
+    
+    best_params_str = str(best_params)
+    if len(best_params_str) > 50:
+        best_params_str = best_params_str[:50] + '...'
     results_df = pd.DataFrame({
         'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
         'Value': [
@@ -938,13 +939,14 @@ def main(gpu_id=None):
             test_metrics["MSE_DE"],
             test_metrics["PCC_DE"],
             test_metrics["R2_DE"]
-        ]
+        ],
+        'Best_Params': [best_params_str] * 6
     })
     results_df.to_csv(f'norman_weissman_evaluation_results_{timestamp}.csv', index=False)
     print_log("\nFinal Evaluation Results:")
     print_log(results_df.to_string(index=False, float_format=lambda x: '{:.6f}'.format(x)))
     
-    # Also save final model with evaluation results
+    
     torch.save({
         'epoch': best_epoch,
         'model_state_dict': model.state_dict(),
@@ -960,4 +962,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Model: Control -> Perturbed Prediction')
     parser.add_argument('--gpu', type=int, default=None, help='GPU ID to use')
     args = parser.parse_args()
+    print("=" * 60)
+    print("Hybrid Attention Model Training")
+    print("=" * 60)
+    if args.gpu is not None:
+        print(f"Using GPU: {args.gpu}")
+    else:
+        print("Using default GPU settings")
     results_df = main(gpu_id=args.gpu)

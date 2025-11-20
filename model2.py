@@ -14,6 +14,7 @@ import pandas as pd
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
 import optuna
+import optuna.logging
 import time
 from datetime import datetime
 import argparse
@@ -93,7 +94,7 @@ class GeneExpressionDataset(Dataset):
         data = np.clip(data, -10, 10)
         data = data / 10.0
         self.original_expression_data = data.copy()
-        self.expression_data = data  # Full gene space [n_cells, n_genes]
+        self.expression_data = data  
         self.n_genes = data.shape[1]
         self.pca = pca_model if pca_model is not None else None
         self.pca_dim = pca_dim if pca_model is not None else None
@@ -110,10 +111,6 @@ class GeneExpressionDataset(Dataset):
             (lower_labels == 'ctrl') | negctrl_mask
         self.reference_perturbation = reference_perturbation
         if len(np.where(control_mask)[0]) == 0 and reference_perturbation is not None:
-            print_log("=" * 60)
-            print_log(f"No control samples found. Using '{reference_perturbation}' as reference baseline.")
-            print_log("Task: reference_perturbation + target_perturbation -> target_expression")
-            print_log("=" * 60)
             ref_mask = perturbation_labels == reference_perturbation
             control_mask = control_mask | ref_mask
         self._control_indices = np.where(control_mask)[0]
@@ -256,7 +253,7 @@ class GeneExpressionDataset(Dataset):
         if self.pca is not None:
             x_target_pca = self.pca.transform(x_target.reshape(1, -1)).flatten()
         else:
-            x_target_pca = x_target.copy()  # Use full gene space if no PCA
+            x_target_pca = x_target.copy() 
         return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor([dose_target]), torch.FloatTensor(x_target_delta), torch.FloatTensor(x_target_pca)
 class GeneEncoder(nn.Module):
     def __init__(self, input_dim, latent_dim=128, hidden_dim=512, n_heads=8, n_layers=2, dropout=0.1):
@@ -438,9 +435,9 @@ class CondOTGRNModel(nn.Module):
                  ot_eps=0.1, ot_max_iter=50, flow_layers=6,
                  model_in_dim=128, bottleneck_dims=(2048, 512), use_bottleneck=True):
         super(CondOTGRNModel, self).__init__()
-        self.input_dim = input_dim  # n_genes (full gene space)
-        self.output_dim = output_dim  # n_genes (full gene space)
-        self.model_in_dim = model_in_dim  # Internal working dimension (previously PCA dim)
+        self.input_dim = input_dim  
+        self.output_dim = output_dim  
+        self.model_in_dim = model_in_dim  
         self.pert_dim = pert_dim
         self.dose_dim = dose_dim
         self.latent_dim = latent_dim
@@ -494,17 +491,17 @@ class CondOTGRNModel(nn.Module):
     def forward(self, x_control, pert, dose, is_training=True):
         assert x_control.dim() == 2 and x_control.size(1) == self.input_dim, \
             f"Expected x_control shape [B, {self.input_dim}], got {x_control.shape}"
-        x_control_proj = self.input_proj(x_control)  # [B, model_in_dim]
+        x_control_proj = self.input_proj(x_control)  
         z_control = self.gene_encoder(x_control_proj)
         p = self.chem_encoder(pert, dose)
         noise_scale = torch.norm(p, dim=1, keepdim=True) * 0.1
         noise = torch.randn_like(z_control) * noise_scale
         z_refined = z_control + noise
         z_refined, log_det_jac = self.flow_refiner(z_refined, p)
-        x_pred_proj = self.gene_decoder(z_refined)  # [B, model_in_dim]
-        x_pred = self.output_head(x_pred_proj)  # [B, n_genes]
+        x_pred_proj = self.gene_decoder(z_refined)  
+        x_pred = self.output_head(x_pred_proj)  
         return {
-            'x_pred': x_pred,  # Delta prediction in full gene space
+            'x_pred': x_pred,  
             'z_control': z_control,
             'z_refined': z_refined,
             'p': p,
@@ -804,8 +801,8 @@ def objective(trial, timestamp):
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = CondOTGRNModel(
-        input_dim=n_genes,  # Full gene space
-        output_dim=n_genes,  # Full gene space  
+        input_dim=n_genes,  
+        output_dim=n_genes,  
         pert_dim=max_pert_dim,
         dose_dim=1,
         latent_dim=params['latent_dim'],
@@ -872,7 +869,7 @@ def objective(trial, timestamp):
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
     return best_val_loss
-def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None):
+def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None, best_params=None):
     model.eval()
     all_predictions = []
     all_targets = []
@@ -884,9 +881,9 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
             x_baseline, pert, dose, x_target_delta, x_target_pca = x_baseline.to(
                 device), pert.to(device), dose.to(device), x_target_delta.to(device), x_target_pca.to(device)
             outputs = model(x_baseline, pert, dose, is_training=False)
-            x_pred_delta = outputs['x_pred']  # Predicted delta
+            x_pred_delta = outputs['x_pred']  
             x_pred_abs = x_baseline + x_pred_delta
-            x_target_abs = x_baseline + x_target_delta  # Ground-truth absolute expression
+            x_target_abs = x_baseline + x_target_delta  
             all_predictions.append(x_pred_abs.cpu().numpy())
             all_targets.append(x_target_abs.cpu().numpy())
             all_perturbations.append(pert.cpu().numpy())
@@ -907,6 +904,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
         'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
         'pca_model': pca_model,
         'scaler': scaler,
+        'best_params': best_params,
         'model_config': {
             'input_dim': model.input_dim,
             'pert_dim': train_dataset.perturbations.shape[1],
@@ -1054,8 +1052,6 @@ def main(gpu_id=None):
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         print_log(f'Available GPUs: {gpu_count}')
-        for i in range(gpu_count):
-            print_log(f'GPU {i}: {torch.cuda.get_device_name(i)}')
         if gpu_id is not None:
             if gpu_id >= gpu_count:
                 print_log(
@@ -1104,7 +1100,7 @@ def main(gpu_id=None):
     train_data = train_data / 10.0
     pca_model = None
     print_log("=" * 60)
-    print_log("CRITICAL: Training in FULL GENE SPACE (no PCA)")
+    print_log("CRITICAL: Training in FULL GENE SPACE")
     print_log(f"Gene count: {len(common_genes)}")
     print_log("Model will use input_proj to project to internal working dimension")
     print_log("=" * 60)
@@ -1120,18 +1116,12 @@ def main(gpu_id=None):
     reference_pert = None
     if not has_control:
         reference_pert = train_pert_counts.index[0]
-        print_log("=" * 60)
-        print_log(f"No control samples found. Using '{reference_pert}' as reference baseline.")
-        print_log(f"Task: {reference_pert}(baseline) + target_perturbation -> target_expression")
-        print_log(f"Training: {reference_pert} -> {', '.join(train_pert_counts.index[1:].tolist())}")
-        print_log(f"Testing: {reference_pert} -> Nutlin (unseen perturbation)")
-        print_log("=" * 60)
     train_dataset = GeneExpressionDataset(
         train_adata,
         perturbation_key='perturbation',
         dose_key='dose_value',
         scaler=scaler,
-        pca_model=None,  # No PCA - use full gene space
+        pca_model=None,  
         pca_dim=128,
         fit_pca=False,
         augment=True,
@@ -1144,14 +1134,15 @@ def main(gpu_id=None):
         perturbation_key='perturbation',
         dose_key='dose_value',
         scaler=scaler,
-        pca_model=None,  # No PCA - use full gene space
+        pca_model=None, 
         pca_dim=128,
         fit_pca=False,
         augment=False,
         is_train=False,
         common_genes_info=common_genes_info,
-        reference_perturbation=reference_pert  # Use same reference for test set
+        reference_perturbation=reference_pert  
     )
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42),
@@ -1173,17 +1164,14 @@ def main(gpu_id=None):
             })
             return result
         study.optimize(objective_with_progress, n_trials=trials)
-    print_log('Best parameters:')
-    for key, value in study.best_params.items():
-        print_log(f'{key}: {value}')
     max_pert_dim, all_pert_names = standardize_perturbation_encoding(
         train_dataset, test_dataset)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     best_params = study.best_params
     final_model = CondOTGRNModel(
-        input_dim=n_genes,  # Full gene space
-        output_dim=n_genes,  # Full gene space  
+        input_dim=n_genes,  
+        output_dim=n_genes,  
         pert_dim=max_pert_dim,
         dose_dim=1,
         latent_dim=best_params['latent_dim'],
@@ -1251,8 +1239,6 @@ def main(gpu_id=None):
             print_log(f'Epoch {epoch+1}/{max_epochs}:')
             print_log(f'Training Loss: {train_loss:.4f}')
             print_log(f'Validation Loss: {val_metrics["loss"]:.4f}')
-            print_log(f'Validation R2 Score: {val_metrics["r2"]:.4f}')
-            print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
             patience_counter = 0
@@ -1277,18 +1263,21 @@ def main(gpu_id=None):
     results = evaluate_and_save_model(
         final_model, test_loader, device,
         f'condot_grn_final_model_{timestamp}.pt',
-        common_genes_info, pca_model, scaler
+        common_genes_info, pca_model, scaler, best_params
     )
+    best_params_str = str(best_params)
+    if len(best_params_str) > 50:
+        best_params_str = best_params_str[:50] + '...'
     results_df = pd.DataFrame({
         'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
         'Value': [results['MSE'], results['PCC'], results['R2'],
                   results['MSE_DE'], results['PCC_DE'], results['R2_DE']],
-        'Best_Params': [str(best_params)] * 6
+        'Best_Params': [best_params_str] * 6
     })
     results_df.to_csv(
         f'condot_grn_evaluation_results_{timestamp}.csv', index=False)
     print_log("\nFinal Evaluation Results:")
-    print(results_df.to_string(index=False,
+    print_log(results_df.to_string(index=False,
           float_format=lambda x: '{:.6f}'.format(x)))
     return results_df
 if __name__ == '__main__':
@@ -1306,11 +1295,10 @@ if __name__ == '__main__':
     if args.list_gpus:
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
-            print_log(f'Available GPUs: {gpu_count}')
             for i in range(gpu_count):
-                print_log(f'GPU {i}: {torch.cuda.get_device_name(i)}')
+                print(f'GPU {i}: {torch.cuda.get_device_name(i)}')
         else:
-            print_log('CUDA not available')
+            print('CUDA not available')
         exit(0)
     print_log("=" * 80)
     print_log("CondOT-GRN Model for Single-Cell Drug Perturbation Prediction")
@@ -1319,8 +1307,6 @@ if __name__ == '__main__':
     print_log(f"Hyperparameter optimization trials: {args.trials}")
     if args.gpu is not None:
         print_log(f"Using specified GPU: {args.gpu}")
-    else:
-        print_log("Using default GPU settings")
     results_df = main(gpu_id=args.gpu)
     print_log("Training completed successfully!")
     print_log("=" * 80)

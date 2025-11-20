@@ -14,6 +14,7 @@ import pandas as pd
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
 import optuna
+import optuna.logging
 from IPython.display import display
 import time
 from datetime import datetime
@@ -606,7 +607,7 @@ def objective(trial, timestamp):
             print(
                 f'Epoch {epoch+1}/{max_epochs} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f}')
     return best_val_loss
-def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None):
+def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None, best_params=None):
     model.eval()
     all_predictions = []
     all_targets = []
@@ -634,6 +635,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
         'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
         'pca_model': pca_model,
         'scaler': scaler,
+        'best_params': best_params,
         'model_config': {
             'input_dim': model.input_dim,
             'pert_dim': model.pert_dim,
@@ -736,6 +738,7 @@ def main(gpu_id=None):
         common_genes_info=common_genes_info
     )
     pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42),
@@ -747,9 +750,6 @@ def main(gpu_id=None):
     )
     print('Starting hyperparameter optimization...')
     study.optimize(lambda trial: objective(trial, timestamp), n_trials=30)
-    print('Best parameters:')
-    for key, value in study.best_params.items():
-        print(f'{key}: {value}')
     best_params = study.best_params
     n_genes = train_dataset.n_genes
     print(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
@@ -813,9 +813,6 @@ def main(gpu_id=None):
             print(f'Epoch {epoch+1}/{max_epochs}:')
             print(f'Training Loss: {train_loss:.4f}')
             print(f'Validation Loss: {val_metrics["loss"]:.4f}')
-            print(f'Validation R2 Score: {val_metrics["r2"]:.4f}')
-            print(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
-            print(f'Validation Perturbation R2: {val_metrics["pert_r2"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
             patience_counter = 0
@@ -839,12 +836,16 @@ def main(gpu_id=None):
     print('Evaluating final RNA model on test set...')
     results = evaluate_and_save_model(final_model, test_loader, device,
                                       f'cite_rna_final_model_{timestamp}.pt',
-                                      common_genes_info, pca_model, scaler)
+                                      common_genes_info, pca_model, scaler, best_params)
+    
+    best_params_str = str(best_params)
+    if len(best_params_str) > 50:
+        best_params_str = best_params_str[:50] + '...'
     results_df = pd.DataFrame({
         'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
         'Value': [results['MSE'], results['PCC'], results['R2'],
                   results['MSE_DE'], results['PCC_DE'], results['R2_DE']],
-        'Best_Params': [str(best_params)] * 6
+        'Best_Params': [best_params_str] * 6
     })
     results_df.to_csv(
         f'cite_rna_evaluation_results_{timestamp}.csv', index=False)

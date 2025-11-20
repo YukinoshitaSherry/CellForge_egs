@@ -397,7 +397,7 @@ def train_model(model, train_loader, optimizer, scheduler, device,
     total_loss = 0
     accumulation_steps = 4
     optimizer.zero_grad()
-    for i, batch in enumerate(train_loader):
+    for i, batch in enumerate(tqdm(train_loader, desc="Training", leave=False)):
         x_baseline, pert, time_emb, x_target_delta = batch
         x_baseline, pert, time_emb, x_target_delta = x_baseline.to(device), pert.to(device), time_emb.to(device), x_target_delta.to(device)
         outputs = model(x_baseline, pert, time_emb)
@@ -430,7 +430,7 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, contrastive_weigh
     all_targets = []
     all_predictions = []
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in tqdm(test_loader, desc="Evaluating", leave=False):
             x_baseline, pert, time_emb, x_target_delta = batch
             x_baseline, pert, time_emb, x_target_delta = x_baseline.to(device), pert.to(device), time_emb.to(device), x_target_delta.to(device)
             outputs = model(x_baseline, pert, time_emb)
@@ -615,7 +615,7 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None)
         'R2_DE': r2_de
     }
 def evaluate_and_save_model(model, test_loader, device, save_path, 
-                           common_genes_info=None, pca_model=None, scaler=None):
+                           common_genes_info=None, pca_model=None, scaler=None, best_params=None):
     model.eval()
     all_predictions = []
     all_targets = []
@@ -644,6 +644,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path,
         'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
         'pca_model': pca_model,
         'scaler': scaler,
+        'best_params': best_params,
         'model_config': {
             'input_dim': model.input_dim,
             'pert_dim': model.pert_dim,
@@ -705,8 +706,6 @@ def main(gpu_id=None):
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         print_log(f'Available GPUs: {gpu_count}')
-        for i in range(gpu_count):
-            print_log(f'GPU {i}: {torch.cuda.get_device_name(i)}')
         if gpu_id is not None:
             if gpu_id >= gpu_count:
                 print_log(f'Warning: Specified GPU {gpu_id} does not exist, using GPU 0')
@@ -818,7 +817,7 @@ def main(gpu_id=None):
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=1e-3,
+        lr=5e-3,
         weight_decay=1e-4
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -827,6 +826,19 @@ def main(gpu_id=None):
         T_mult=2,
         eta_min=1e-6
     )
+    best_params = {
+        'input_dim': n_genes,
+        'output_dim': n_genes,
+        'pert_dim': pert_dim,
+        'time_dim': 3,
+        'latent_dim': 128,
+        'hidden_dim': 512,
+        'use_optimal_transport': True,
+        'use_contrastive': True,
+        'learning_rate': 5e-3,
+        'weight_decay': 1e-4,
+        'batch_size': 64
+    }
     print_log('Training model...')
     best_loss = float('inf')
     best_model = None
@@ -840,8 +852,6 @@ def main(gpu_id=None):
             print_log(f'Epoch {epoch+1}/{max_epochs}:')
             print_log(f'Training Loss: {train_loss:.4f}')
             print_log(f'Validation Loss: {val_metrics["loss"]:.4f}')
-            print_log(f'Validation R2 Score: {val_metrics["r2"]:.4f}')
-            print_log(f'Validation Pearson Correlation: {val_metrics["pearson"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
             patience_counter = 0
@@ -852,7 +862,8 @@ def main(gpu_id=None):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
-                'metrics': val_metrics
+                'metrics': val_metrics,
+                'best_params': best_params
             }, f'cytokines_best_model_{timestamp}.pt')
             print_log(f"Saved best model with validation loss: {best_loss:.4f}")
         else:
@@ -864,11 +875,16 @@ def main(gpu_id=None):
     print_log('Evaluating final model on test set...')
     results = evaluate_and_save_model(model, test_loader, device, 
                                     f'cytokines_final_model_{timestamp}.pt', 
-                                    common_genes_info, pca_model, scaler)
+                                    common_genes_info, pca_model, scaler, best_params)
+    
+    best_params_str = str(best_params)
+    if len(best_params_str) > 50:
+        best_params_str = best_params_str[:50] + '...'
     results_df = pd.DataFrame({
         'Metric': ['MSE', 'PCC', 'R2', 'MSE_DE', 'PCC_DE', 'R2_DE'],
         'Value': [results['MSE'], results['PCC'], results['R2'], 
-                 results['MSE_DE'], results['PCC_DE'], results['R2_DE']]
+                 results['MSE_DE'], results['PCC_DE'], results['R2_DE']],
+        'Best_Params': [best_params_str] * 6
     })
     results_df.to_csv(f'cytokines_evaluation_results_{timestamp}.csv', index=False)
     print_log("\nFinal Evaluation Results:")
