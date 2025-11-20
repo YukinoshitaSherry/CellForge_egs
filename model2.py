@@ -15,11 +15,12 @@ from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
 import optuna
 import optuna.logging
+from IPython.display import display
 import time
 from datetime import datetime
 import argparse
+import math
 import warnings
-from typing import Dict, List, Tuple, Optional, Union
 import random
 warnings.filterwarnings('ignore')
 def print_log(message):
@@ -37,22 +38,17 @@ train_dataset = None
 test_dataset = None
 device = None
 pca_model = None
-scaler = None
-class GeneExpressionDataset(Dataset):
-    def __init__(self, adata, perturbation_key='perturbation', dose_key='dose_value',
-                 scaler=None, pca_model=None, pca_dim=128, fit_pca=False,
-                 augment=False, is_train=True, common_genes_info=None,
-                 use_hvg=True, n_hvg=5000, reference_perturbation=None):
+class ATACDataset(Dataset):
+    def __init__(self, adata, perturbation_key='perturbation', scaler=None, pca_model=None,
+                 pca_dim=128, fit_pca=False, augment=False, is_train=True,
+                 common_genes_info=None):
         self.adata = adata
         self.perturbation_key = perturbation_key
-        self.dose_key = dose_key
         self.augment = augment
         self.training = True
         self.pca_dim = pca_dim
         self.is_train = is_train
         self.common_genes_info = common_genes_info
-        self.use_hvg = use_hvg
-        self.n_hvg = n_hvg
         if common_genes_info is not None:
             if is_train:
                 gene_idx = common_genes_info['train_idx']
@@ -94,72 +90,51 @@ class GeneExpressionDataset(Dataset):
         data = np.clip(data, -10, 10)
         data = data / 10.0
         self.original_expression_data = data.copy()
-        self.expression_data = data  
+        self.expression_data = data
         self.n_genes = data.shape[1]
         self.pca = pca_model if pca_model is not None else None
         self.pca_dim = pca_dim if pca_model is not None else None
-        self.perturbations = pd.get_dummies(
-            adata.obs[perturbation_key]).values.astype(np.float32)
-        print_log(
-            f"{'Training' if is_train else 'Test'} set perturbation dim: {self.perturbations.shape[1]}")
         self.perturbation_names = list(adata.obs[perturbation_key].unique())
+        self.perturbations = pd.get_dummies(adata.obs[perturbation_key]).values
+        print(
+            f"{'train' if is_train else 'test'} set perturbation dimension: {self.perturbations.shape[1]}")
         perturbation_labels = adata.obs[perturbation_key].astype(str).values
         perturbation_labels = np.array(perturbation_labels, dtype='U')
         lower_labels = np.char.lower(perturbation_labels)
         negctrl_mask = np.char.find(lower_labels, 'negctrl') >= 0
         control_mask = (lower_labels == 'control') | \
             (lower_labels == 'ctrl') | negctrl_mask
-        self.reference_perturbation = reference_perturbation
-        if len(np.where(control_mask)[0]) == 0 and reference_perturbation is not None:
-            ref_mask = perturbation_labels == reference_perturbation
-            control_mask = control_mask | ref_mask
-        self._control_indices = np.where(control_mask)[0]
-        self._non_control_indices = np.where(~control_mask)[0]
+        control_indices = np.where(control_mask)[0]
+        non_control_indices = np.where(~control_mask)[0]
         self._pert_to_indices = {}
         for pert_name in self.perturbation_names:
             pert_mask = perturbation_labels == pert_name
             pert_indices = np.where(pert_mask)[0]
-            pert_indices = pert_indices[~np.isin(pert_indices, self._control_indices)]
+            pert_indices = pert_indices[~np.isin(pert_indices, control_indices)]
             if len(pert_indices) > 0:
                 self._pert_to_indices[pert_name] = pert_indices
-        self._non_control_pert_names = [name for name in self.perturbation_names 
-                                        if name not in ['control', 'Control', 'ctrl', 'Ctrl'] 
+        self._non_control_pert_names = [name for name in self.perturbation_names
+                                        if name not in ['control', 'Control', 'ctrl', 'Ctrl']
                                         and 'negctrl' not in name.lower()]
-        if reference_perturbation is not None and reference_perturbation in self._non_control_pert_names:
-            self._non_control_pert_names = [name for name in self._non_control_pert_names 
-                                            if name != reference_perturbation]
+        self._control_indices = control_indices
+        self._non_control_indices = non_control_indices
         if len(self._control_indices) == 0:
             if self.is_train:
                 raise ValueError(
                     "CRITICAL ERROR: Training set has NO control samples! "
                     "Control samples are REQUIRED for perturbation prediction. "
                     "This model performs control -> perturbed prediction, NOT autoencoder. "
-                    "Options:\n"
-                    "  1. Ensure your training data includes control samples (labeled as 'control' or containing 'NegCtrl').\n"
-                    "  2. Use 'reference_perturbation' parameter to specify a reference perturbation as baseline.\n"
-                    "     Example: reference_perturbation='SAHA' (for Srivatsan dataset)"
+                    "Please ensure your training data includes control samples (labeled as 'control' or containing 'NegCtrl')."
                 )
             else:
                 raise ValueError(
                     "CRITICAL ERROR: Test set has NO control samples! "
                     "For unseen perturbation prediction, test set should use training set control baseline. "
-                    "Please ensure training set has control samples or use reference_perturbation parameter."
+                    "Please ensure training set has control samples."
                 )
         self.rng = np.random.RandomState(42)
         if not self.is_train:
             self._create_fixed_pairs_for_test()
-        if dose_key in adata.obs.columns:
-            dose_values = pd.to_numeric(adata.obs[dose_key], errors='coerce')
-            dose_values = dose_values.fillna(0.0)
-            if dose_values.max() > dose_values.min():
-                self.dose_values = (dose_values - dose_values.min()) / \
-                    (dose_values.max() - dose_values.min())
-            else:
-                self.dose_values = np.zeros_like(dose_values)
-        else:
-            self.dose_values = np.zeros(len(adata))
-        print_log(
-            f"Dataset created: {len(self.adata)} cells, {self.expression_data.shape[1]} features")
     def _create_fixed_pairs_for_test(self):
         n = len(self.adata)
         self.pairs = [None] * n
@@ -191,7 +166,6 @@ class GeneExpressionDataset(Dataset):
     def __getitem__(self, idx):
         x_current = self.expression_data[idx]
         pert = self.perturbations[idx]
-        dose = self.dose_values[idx]
         if self.is_train:
             if idx in self._control_indices:
                 x_baseline = x_current
@@ -202,23 +176,19 @@ class GeneExpressionDataset(Dataset):
                         target_idx = int(self.rng.choice(pert_indices))
                         x_target = self.original_expression_data[target_idx]
                         pert_target = self.perturbations[target_idx]
-                        dose_target = self.dose_values[target_idx]
                     else:
                         target_idx = int(self.rng.choice(self._non_control_indices))
                         x_target = self.original_expression_data[target_idx]
                         pert_target = self.perturbations[target_idx]
-                        dose_target = self.dose_values[target_idx]
                 else:
                     alternative_controls = self._control_indices[self._control_indices != idx]
                     if len(alternative_controls) > 0:
                         target_idx = int(self.rng.choice(alternative_controls))
                         x_target = self.original_expression_data[target_idx]
                         pert_target = self.perturbations[target_idx]
-                        dose_target = self.dose_values[target_idx]
                     else:
                         x_target = self.original_expression_data[idx]
                         pert_target = pert
-                        dose_target = dose
             else:
                 if len(self._control_indices) > 0:
                     baseline_idx = int(self.rng.choice(self._control_indices))
@@ -227,7 +197,6 @@ class GeneExpressionDataset(Dataset):
                     x_baseline = x_current
                 x_target = self.original_expression_data[idx]
                 pert_target = pert
-                dose_target = dose
         else:
             baseline_idx, target_idx = self.pairs[idx]
             if baseline_idx == idx and idx in self._control_indices:
@@ -237,212 +206,81 @@ class GeneExpressionDataset(Dataset):
             x_target = self.original_expression_data[target_idx]
             if target_idx == idx:
                 pert_target = pert
-                dose_target = dose
             else:
                 pert_target = self.perturbations[target_idx]
-                dose_target = self.dose_values[target_idx]
         x_target_delta = x_target - x_baseline
         if self.augment and self.training:
             noise = np.random.normal(0, 0.05, x_baseline.shape)
             x_baseline = x_baseline + noise
             mask = np.random.random(x_baseline.shape) > 0.05
             x_baseline = x_baseline * mask
-        x_baseline = x_baseline.astype(np.float32)
-        pert_target = pert_target.astype(np.float32)
-        dose_target = np.float32(dose_target)
-        if self.pca is not None:
-            x_target_pca = self.pca.transform(x_target.reshape(1, -1)).flatten()
-        else:
-            x_target_pca = x_target.copy() 
-        return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor([dose_target]), torch.FloatTensor(x_target_delta), torch.FloatTensor(x_target_pca)
-class GeneEncoder(nn.Module):
-    def __init__(self, input_dim, latent_dim=128, hidden_dim=512, n_heads=8, n_layers=2, dropout=0.1):
-        super(GeneEncoder, self).__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        mlp_layers = []
-        for _ in range(n_layers):
-            mlp_layers.extend([
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout)
-            ])
-        self.mlp = nn.Sequential(*mlp_layers) if mlp_layers else nn.Identity()
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, latent_dim)
-        )
-    def forward(self, x):
-        x = self.input_proj(x)
-        x = self.mlp(x)
-        z = self.output_proj(x)
-        return z
-class ChemEncoder(nn.Module):
-    def __init__(self, pert_dim, dose_dim=1, chem_dim=64, hidden_dim=256, dropout=0.1):
-        super(ChemEncoder, self).__init__()
-        self.pert_dim = pert_dim
-        self.dose_dim = dose_dim
-        self.chem_dim = chem_dim
-        self.pert_encoder = nn.Sequential(
-            nn.Linear(pert_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+        return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor(x_target_delta)
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(
+            half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        if embeddings.shape[-1] != self.dim:
+            if embeddings.shape[-1] < self.dim:
+                padding = torch.zeros(
+                    embeddings.shape[0], self.dim - embeddings.shape[-1], device=device)
+                embeddings = torch.cat([embeddings, padding], dim=-1)
+            else:
+                embeddings = embeddings[:, :self.dim]
+        return embeddings
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim, dropout=0.1):
+        super().__init__()
+        self.time_mlp = nn.Linear(time_emb_dim, out_channels)
+        self.block1 = nn.Sequential(
+            nn.Linear(in_channels, out_channels),
+            nn.LayerNorm(out_channels),
             nn.GELU(),
             nn.Dropout(dropout)
         )
-        self.dose_encoder = nn.Sequential(
-            nn.Linear(dose_dim, 32),
+        self.block2 = nn.Sequential(
+            nn.Linear(out_channels, out_channels),
+            nn.LayerNorm(out_channels),
             nn.GELU(),
-            nn.Linear(32, 32),
+            nn.Dropout(dropout)
+        )
+        self.res_conv = nn.Linear(
+            in_channels, out_channels) if in_channels != out_channels else nn.Identity()
+    def forward(self, x, time_emb):
+        h = self.block1(x)
+        time_emb = self.time_mlp(time_emb)
+        h = h + time_emb
+        h = self.block2(h)
+        return h + self.res_conv(x)
+class ConditionalDiffusionModel(nn.Module):
+    def __init__(self, input_dim, output_dim, train_pert_dim, test_pert_dim, hidden_dim=512,
+                 n_layers=4, n_heads=8, dropout=0.1, time_emb_dim=128,
+                 diffusion_steps=1000, pert_emb_dim=64,
+                 model_in_dim=128, bottleneck_dims=(2048, 512), use_bottleneck=True):
+        super(ConditionalDiffusionModel, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.model_in_dim = model_in_dim
+        self.train_pert_dim = train_pert_dim
+        self.test_pert_dim = test_pert_dim
+        assert train_pert_dim == test_pert_dim, "After standardization, train_pert_dim and test_pert_dim must be equal"
+        self.use_bottleneck = use_bottleneck
+        self.hidden_dim = ((hidden_dim + n_heads - 1) // n_heads) * n_heads
+        self.diffusion_steps = diffusion_steps
+        self.time_emb_dim = time_emb_dim
+        self.pert_emb_dim = pert_emb_dim
+        self.time_embeddings = SinusoidalPositionEmbeddings(time_emb_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim),
             nn.GELU()
         )
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim // 2 + 32, chem_dim),
-            nn.LayerNorm(chem_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-    def forward(self, pert, dose):
-        pert_feat = self.pert_encoder(pert)
-        dose_feat = self.dose_encoder(dose)
-        combined = torch.cat([pert_feat, dose_feat], dim=1)
-        p = self.fusion(combined)
-        return p
-class ConditionalOT(nn.Module):
-    def __init__(self, latent_dim, chem_dim, eps=0.1, max_iter=50):
-        super(ConditionalOT, self).__init__()
-        self.latent_dim = latent_dim
-        self.chem_dim = chem_dim
-        self.eps = eps
-        self.max_iter = max_iter
-    def sinkhorn(self, a, b, C, eps, max_iter):
-        u = torch.zeros_like(a)
-        v = torch.zeros_like(b)
-        for _ in range(max_iter):
-            u = eps * (torch.log(a + 1e-8) -
-                       torch.logsumexp((u.unsqueeze(1) + v.unsqueeze(0) - C) / eps, dim=1))
-            v = eps * (torch.log(b + 1e-8) -
-                       torch.logsumexp((u.unsqueeze(1) + v.unsqueeze(0) - C) / eps, dim=0))
-        P = torch.exp((u.unsqueeze(1) + v.unsqueeze(0) - C) / eps)
-        return P
-    def forward(self, z_control, z_perturbed, p):
-        batch_size = z_control.size(0)
-        a = torch.ones(batch_size, device=z_control.device) / batch_size
-        b = torch.ones(batch_size, device=z_control.device) / batch_size
-        C = torch.cdist(z_control, z_perturbed, p=2) ** 2
-        P = self.sinkhorn(a, b, C, self.eps, self.max_iter)
-        z_ot_pred = torch.mm(P, z_perturbed)
-        return z_ot_pred, P
-class FlowRefiner(nn.Module):
-    def __init__(self, latent_dim, chem_dim, n_layers=6, hidden_dim=256):
-        super(FlowRefiner, self).__init__()
-        self.latent_dim = latent_dim
-        self.chem_dim = chem_dim
-        self.n_layers = n_layers
-        self.coupling_layers = nn.ModuleList()
-        for i in range(n_layers):
-            self.coupling_layers.append(
-                CouplingLayer(latent_dim, chem_dim,
-                              hidden_dim, mask_type=i % 2)
-            )
-    def forward(self, z_ot, p):
-        z = z_ot
-        log_det_jac = 0
-        for layer in self.coupling_layers:
-            z, log_det = layer(z, p)
-            log_det_jac += log_det
-        return z, log_det_jac
-class CouplingLayer(nn.Module):
-    def __init__(self, latent_dim, chem_dim, hidden_dim, mask_type=0):
-        super(CouplingLayer, self).__init__()
-        self.latent_dim = latent_dim
-        self.mask_type = mask_type
-        mask = torch.zeros(latent_dim)
-        mask[mask_type::2] = 1
-        self.register_buffer('mask', mask)
-        self.scale_net = nn.Sequential(
-            nn.Linear(latent_dim // 2 + chem_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim // 2),
-            nn.Tanh()
-        )
-        self.translate_net = nn.Sequential(
-            nn.Linear(latent_dim // 2 + chem_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim // 2)
-        )
-    def forward(self, z, p):
-        masked_z = z * self.mask
-        unmasked_z = z * (1 - self.mask)
-        z1, z2 = torch.chunk(unmasked_z, 2, dim=1)
-        scale_input = torch.cat([z1, p], dim=1)
-        scale = self.scale_net(scale_input)
-        translate = self.translate_net(scale_input)
-        z2_new = z2 * torch.exp(scale) + translate
-        z_new = masked_z + torch.cat([z1, z2_new], dim=1) * (1 - self.mask)
-        log_det_jac = scale.sum(dim=1)
-        return z_new, log_det_jac
-class GeneDecoder(nn.Module):
-    def __init__(self, latent_dim, output_dim, hidden_dim=512, n_modules=10, dropout=0.1):
-        super(GeneDecoder, self).__init__()
-        self.latent_dim = latent_dim
-        self.output_dim = output_dim
-        self.n_modules = n_modules
-        self.main_decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        self.module_heads = nn.ModuleList()
-        module_size = output_dim // n_modules
-        for i in range(n_modules):
-            start_idx = i * module_size
-            end_idx = start_idx + module_size if i < n_modules - 1 else output_dim
-            head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.LayerNorm(hidden_dim // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim // 2, end_idx - start_idx)
-            )
-            self.module_heads.append(head)
-        self.global_residual = nn.Linear(latent_dim, output_dim)
-    def forward(self, z):
-        main_feat = self.main_decoder(z)
-        module_outputs = []
-        for head in self.module_heads:
-            module_outputs.append(head(main_feat))
-        module_pred = torch.cat(module_outputs, dim=1)
-        global_pred = self.global_residual(z)
-        output = module_pred + 0.1 * global_pred
-        return output
-class CondOTGRNModel(nn.Module):
-    def __init__(self, input_dim, output_dim, pert_dim, dose_dim=1, latent_dim=128, chem_dim=64,
-                 hidden_dim=512, n_heads=8, n_layers=2, dropout=0.1,
-                 ot_eps=0.1, ot_max_iter=50, flow_layers=6,
-                 model_in_dim=128, bottleneck_dims=(2048, 512), use_bottleneck=True):
-        super(CondOTGRNModel, self).__init__()
-        self.input_dim = input_dim  
-        self.output_dim = output_dim  
-        self.model_in_dim = model_in_dim  
-        self.pert_dim = pert_dim
-        self.dose_dim = dose_dim
-        self.latent_dim = latent_dim
-        self.chem_dim = chem_dim
-        self.use_bottleneck = use_bottleneck
         if self.use_bottleneck:
             self.input_proj = nn.Sequential(
                 nn.Linear(self.input_dim, bottleneck_dims[0]),
@@ -462,23 +300,52 @@ class CondOTGRNModel(nn.Module):
                 nn.LayerNorm(self.model_in_dim),
                 nn.GELU()
             )
-        self.gene_encoder = GeneEncoder(
-            self.model_in_dim, latent_dim, hidden_dim, n_heads, n_layers, dropout)
-        self.chem_encoder = ChemEncoder(
-            pert_dim, dose_dim, chem_dim, hidden_dim, dropout)
-        self.conditional_ot = ConditionalOT(
-            latent_dim, chem_dim, ot_eps, ot_max_iter)
-        self.flow_refiner = FlowRefiner(
-            latent_dim, chem_dim, flow_layers, hidden_dim)
-        self.gene_decoder = GeneDecoder(
-            latent_dim, self.model_in_dim, hidden_dim, n_modules=10, dropout=dropout)
-        self.output_head = nn.Sequential(
-            nn.Linear(self.model_in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        self.model_input_proj = nn.Linear(self.model_in_dim, self.hidden_dim)
+        self.pert_encoder = nn.Sequential(
+            nn.Linear(train_pert_dim, pert_emb_dim),
+            nn.LayerNorm(pert_emb_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.cond_proj = nn.Linear(
+            pert_emb_dim + time_emb_dim, self.hidden_dim)
+        mlp_layers = []
+        for _ in range(n_layers):
+            mlp_layers.extend([
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ])
+        self.mlp = nn.Sequential(*mlp_layers) if mlp_layers else nn.Identity()
+        self.output_proj = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, self.output_dim)
-        )  
+            nn.Linear(self.hidden_dim, output_dim)
+        )
+        self.noise_proj = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, self.model_in_dim)
+        )
+        self.output_head = nn.Sequential(
+            nn.Linear(self.model_in_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, output_dim)
+        )
+        self.pert_head_shared = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim//2),
+            nn.LayerNorm(self.hidden_dim//2),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.perturbation_head = nn.Linear(self.hidden_dim//2, train_pert_dim)
         self.apply(self._init_weights)
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -488,208 +355,252 @@ class CondOTGRNModel(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
-    def forward(self, x_control, pert, dose, is_training=True):
-        assert x_control.dim() == 2 and x_control.size(1) == self.input_dim, \
-            f"Expected x_control shape [B, {self.input_dim}], got {x_control.shape}"
-        x_control_proj = self.input_proj(x_control)  
-        z_control = self.gene_encoder(x_control_proj)
-        p = self.chem_encoder(pert, dose)
-        noise_scale = torch.norm(p, dim=1, keepdim=True) * 0.1
-        noise = torch.randn_like(z_control) * noise_scale
-        z_refined = z_control + noise
-        z_refined, log_det_jac = self.flow_refiner(z_refined, p)
-        x_pred_proj = self.gene_decoder(z_refined)  
-        x_pred = self.output_head(x_pred_proj)  
-        return {
-            'x_pred': x_pred,  
-            'z_control': z_control,
-            'z_refined': z_refined,
-            'p': p,
-            'transport_plan': None,  
-            'log_det_jac': log_det_jac
-        }
-def train_model(model, train_loader, optimizer, scheduler, device, loss_weights=None):
+    def forward(self, x, pert, timestep, is_train=True):
+        assert x.dim() == 2 and x.size(1) == self.input_dim, \
+            f"Expected x shape [B, {self.input_dim}], got {x.shape}"
+        batch_size = x.shape[0]
+        x_proj = self.input_proj(x)
+        time_emb = self.time_embeddings(timestep)
+        time_emb = self.time_mlp(time_emb)
+        pert_emb = self.pert_encoder(pert)
+        cond_emb = torch.cat([pert_emb, time_emb], dim=-1)
+        cond_emb = self.cond_proj(cond_emb)
+        x_proj_model = self.model_input_proj(x_proj)
+        x_cond = x_proj_model + cond_emb
+        x_trans = self.mlp(x_cond)
+        noise_pred_proj = self.noise_proj(x_trans)
+        noise_pred = self.output_head(noise_pred_proj)
+        output = self.output_head(noise_pred_proj)  
+        x_pert_feat = self.pert_head_shared(x_trans)
+        pert_pred = self.perturbation_head(x_pert_feat)
+        return noise_pred, pert_pred, output
+class DiffusionModel(nn.Module):
+    def __init__(self, model, diffusion_steps=1000, beta_start=1e-4, beta_end=0.02):
+        super().__init__()
+        self.model = model
+        self.diffusion_steps = diffusion_steps
+        self.register_buffer('betas', torch.linspace(
+            beta_start, beta_end, diffusion_steps))
+        self.register_buffer('alphas', 1.0 - self.betas)
+        self.register_buffer('alpha_bars', torch.cumprod(self.alphas, dim=0))
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        sqrt_alpha_bar_t = torch.sqrt(self.alpha_bars[t]).view(-1, 1)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(
+            1 - self.alpha_bars[t]).view(-1, 1)
+        return sqrt_alpha_bar_t * x_start + sqrt_one_minus_alpha_bar_t * noise
+    def p_sample(self, x, pert, t, is_train=True):
+        with torch.no_grad():
+            pred_noise, _, _ = self.model(x, pert, t, is_train)
+            alpha_t = self.alphas[t].view(-1, 1)
+            alpha_bar_t = self.alpha_bars[t].view(-1, 1)
+            beta_t = self.betas[t].view(-1, 1)
+            
+            
+            eps = 1e-8
+            sqrt_alpha_bar_t = torch.sqrt(torch.clamp(alpha_bar_t, min=eps))
+            sqrt_one_minus_alpha_bar_t = torch.sqrt(torch.clamp(1 - alpha_bar_t, min=eps))
+            sqrt_alpha_t = torch.sqrt(torch.clamp(alpha_t, min=eps))
+            
+            pred_x_start = (x - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
+            
+            
+            if torch.any(torch.isnan(pred_x_start)) or torch.any(torch.isinf(pred_x_start)):
+                pred_x_start = torch.clamp(pred_x_start, min=-10.0, max=10.0)
+                pred_x_start = torch.where(torch.isnan(pred_x_start) | torch.isinf(pred_x_start), 
+                                           x, pred_x_start)
+            
+            if t[0].item() > 0:
+                noise = torch.randn_like(x)
+                mean = (pred_x_start * sqrt_alpha_bar_t + x * sqrt_one_minus_alpha_bar_t) / sqrt_alpha_t
+                
+                
+                if torch.any(torch.isnan(mean)) or torch.any(torch.isinf(mean)):
+                    mean = torch.clamp(mean, min=-10.0, max=10.0)
+                    mean = torch.where(torch.isnan(mean) | torch.isinf(mean), x, mean)
+                
+                result = mean + torch.sqrt(torch.clamp(beta_t, min=eps)) * noise
+                
+                
+                if torch.any(torch.isnan(result)) or torch.any(torch.isinf(result)):
+                    result = torch.clamp(result, min=-10.0, max=10.0)
+                    result = torch.where(torch.isnan(result) | torch.isinf(result), x, result)
+                
+                return result
+            else:
+                return pred_x_start
+    def p_sample_loop(self, shape, pert, is_train=True):
+        device = next(self.parameters()).device
+        x = torch.randn(shape, device=device)
+        for t in reversed(range(self.diffusion_steps)):
+            t_tensor = torch.full(
+                (shape[0],), t, device=device, dtype=torch.long)
+            x = self.p_sample(x, pert, t_tensor, is_train)
+        return x
+    def p_sample_loop_from_baseline(self, x_baseline, pert, is_train=True, noise_scale=0.1):
+        device = next(self.parameters()).device
+        x = x_baseline + noise_scale * torch.randn_like(x_baseline)
+        
+        start_t = max(1, self.diffusion_steps // 4)  
+        for t in reversed(range(start_t)):
+            t_tensor = torch.full(
+                (x.shape[0],), t, device=device, dtype=torch.long)
+            x = self.p_sample(x, pert, t_tensor, is_train)
+            
+            
+            if torch.any(torch.isnan(x)) or torch.any(torch.isinf(x)):
+                x = torch.clamp(x, min=-10.0, max=10.0)
+                x = torch.where(torch.isnan(x) | torch.isinf(x), x_baseline, x)
+        
+        return x
+    def forward(self, x_start, pert, is_train=True):
+        batch_size = x_start.shape[0]
+        device = x_start.device
+        t = torch.randint(0, self.diffusion_steps,
+                          (batch_size,), device=device)
+        noise = torch.randn_like(x_start)
+        x_noisy = self.q_sample(x_start, t, noise)
+        pred_noise, pert_pred, _ = self.model(x_noisy, pert, t, is_train)
+        return pred_noise, pert_pred, noise, t
+def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.1):
     model.train()
     total_loss = 0
     accumulation_steps = 4
     optimizer.zero_grad()
-    if loss_weights is None:
-        loss_weights = {
-            'recon': 1.0,
-            'ot': 0.1,
-            'flow': 0.1,
-            'de': 0.5,
-            'grn': 0.01,
-            'reg': 1e-5
-        }
-    for i, batch in enumerate(tqdm(train_loader, desc="Training", leave=False)):
-        x_baseline, pert, dose, x_target_delta, x_target_pca = batch
-        x_baseline, pert, dose, x_target_delta, x_target_pca = x_baseline.to(
-            device), pert.to(device), dose.to(device), x_target_delta.to(device), x_target_pca.to(device)
-        outputs = model(x_baseline, pert, dose, is_training=True)
-        recon_loss = F.mse_loss(outputs['x_pred'], x_target_delta)
-        with torch.no_grad():
-            x_target_abs = x_baseline + x_target_delta
-            if x_target_abs.size(1) == model.input_dim:
-                x_target_proj = model.input_proj(x_target_abs)
-            else:
-                x_target_proj = x_target_abs
-            z_target = model.gene_encoder(x_target_proj)
-        z_ot_pred, transport_plan = model.conditional_ot(
-            outputs['z_control'], z_target.detach(), outputs['p'])
-        cost_matrix = torch.cdist(outputs['z_control'], z_target, p=2) ** 2
-        ot_loss = torch.sum(transport_plan * cost_matrix) / x_baseline.size(0)
-        flow_loss = F.mse_loss(outputs['z_refined'], z_ot_pred.detach()) + 0.01 * outputs['log_det_jac'].pow(2).mean()
-        grn_loss = torch.tensor(0.0, device=device)
-        reg_loss = sum(p.pow(2.0).mean() for p in model.parameters())
-        total_loss_batch = (loss_weights['recon'] * recon_loss +
-                            loss_weights['ot'] * ot_loss +
-                            loss_weights['flow'] * flow_loss +
-                            loss_weights['grn'] * grn_loss +
-                            loss_weights['reg'] * reg_loss)
-        total_loss_batch = total_loss_batch / accumulation_steps
-        total_loss_batch.backward()
+    for i, batch in enumerate(train_loader):
+        x_baseline, pert, x_target_delta = batch
+        x_baseline, pert, x_target_delta = x_baseline.to(
+            device), pert.to(device), x_target_delta.to(device)
+        x_target_abs = x_baseline + x_target_delta
+        pred_noise, pert_pred, noise, t = model(x_target_abs, pert, is_train=True)
+        diffusion_loss = F.mse_loss(pred_noise, noise)
+        aux_loss = F.mse_loss(pert_pred, pert)
+        loss = diffusion_loss + aux_weight * aux_loss
+        loss = loss / accumulation_steps
+        loss.backward()
         if (i + 1) % accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-        total_loss += total_loss_batch.item() * accumulation_steps
+        total_loss += loss.item() * accumulation_steps
     return total_loss / len(train_loader)
-def evaluate_model(model, test_loader, device, loss_weights=None):
+def evaluate_model(model, test_loader, device, aux_weight=0.1):
     model.eval()
     total_loss = 0
     all_targets = []
     all_predictions = []
-    if loss_weights is None:
-        loss_weights = {
-            'recon': 1.0,
-            'ot': 0.1,
-            'flow': 0.1,
-            'de': 0.5,
-            'grn': 0.01,
-            'reg': 1e-5
-        }
+    all_perts = []
+    all_pert_preds = []
+    valid_batches = 0
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Evaluating", leave=False):
-            x_baseline, pert, dose, x_target_delta, x_target_pca = batch
-            x_baseline, pert, dose, x_target_delta, x_target_pca = x_baseline.to(
-                device), pert.to(device), dose.to(device), x_target_delta.to(device), x_target_pca.to(device)
-            outputs = model(x_baseline, pert, dose, is_training=False)
-            recon_loss = F.mse_loss(outputs['x_pred'], x_target_delta)
-            with torch.no_grad():
-                x_target_abs = x_baseline + x_target_delta
-                if x_target_abs.size(1) == model.input_dim:
-                    x_target_proj = model.input_proj(x_target_abs)
-                else:
-                    x_target_proj = x_target_abs
-                z_target = model.gene_encoder(x_target_proj)
-            z_ot_pred, transport_plan = model.conditional_ot(
-                outputs['z_control'], z_target.detach(), outputs['p'])
-            cost_matrix = torch.cdist(outputs['z_control'], z_target, p=2) ** 2
-            ot_loss = torch.sum(transport_plan * cost_matrix) / x_baseline.size(0)
-            flow_loss = 0.01 * outputs['log_det_jac'].pow(2).mean()
-            grn_loss = torch.tensor(0.0, device=device)
-            reg_loss = sum(p.pow(2.0).mean() for p in model.parameters())
-            loss = (loss_weights['recon'] * recon_loss +
-                    loss_weights['ot'] * ot_loss +
-                    loss_weights['flow'] * flow_loss +
-                    loss_weights['grn'] * grn_loss +
-                    loss_weights['reg'] * reg_loss)
-            total_loss += loss.item()
+        for batch in test_loader:
+            x_baseline, pert, x_target_delta = batch
+            x_baseline, pert, x_target_delta = x_baseline.to(
+                device), pert.to(device), x_target_delta.to(device)
+            x_pred_abs = model.p_sample_loop_from_baseline(x_baseline, pert, is_train=False)
+            
+            
+            if torch.any(torch.isnan(x_pred_abs)) or torch.any(torch.isinf(x_pred_abs)):
+                
+                x_pred_abs = x_baseline.clone()
+            
             x_target_abs = x_baseline + x_target_delta
-            x_target_np = x_target_abs.cpu().numpy()
-            x_pred_abs = x_baseline + outputs['x_pred']
-            x_pred_np = x_pred_abs.cpu().numpy()
-            if not (np.any(np.isnan(x_target_np)) or np.any(np.isnan(x_pred_np)) or \
-               np.any(np.isinf(x_target_np)) or np.any(np.isinf(x_pred_np))):
-                all_targets.append(x_target_np)
-                all_predictions.append(x_pred_np)
-    if len(all_targets) > 0:
-        all_targets = np.concatenate(all_targets, axis=0)
-        all_predictions = np.concatenate(all_predictions, axis=0)
-        try:
-            r2 = r2_score(all_targets, all_predictions)
-            if np.isnan(r2):
-                r2 = 0.0
-        except:
-            r2 = 0.0
-        try:
-            pred_flat = all_predictions.flatten()
-            true_flat = all_targets.flatten()
-            if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
-                pearson = pearsonr(true_flat, pred_flat)[0]
-                if np.isnan(pearson):
-                    pearson = 0.0
+            diffusion_loss = F.mse_loss(x_pred_abs, x_target_abs)
+            
+            
+            if torch.isnan(diffusion_loss) or torch.isinf(diffusion_loss):
+                continue  
+            
+            t_dummy = torch.randint(0, model.diffusion_steps, (x_baseline.shape[0],), device=device)
+            _, pert_pred, _ = model.model(x_pred_abs, pert, t_dummy, is_train=False)
+            
+            if pert_pred.shape[1] == pert.shape[1]:
+                aux_loss = F.mse_loss(pert_pred, pert)
+                
+                if torch.isnan(aux_loss) or torch.isinf(aux_loss):
+                    aux_loss = torch.tensor(0.0, device=device)
             else:
-                pearson = 0.0
-        except:
+                aux_loss = torch.tensor(0.0, device=device)
+            
+            loss = diffusion_loss + aux_weight * aux_loss
+            
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue  
+            
+            total_loss += loss.item()
+            valid_batches += 1
+            all_targets.append(x_target_abs.cpu().numpy())
+            all_predictions.append(x_pred_abs.cpu().numpy())
+            if pert_pred.shape[1] == pert.shape[1]:
+                all_perts.append(pert.cpu().numpy())
+                all_pert_preds.append(pert_pred.cpu().numpy())
+    if valid_batches == 0:
+        
+        return {
+            'loss': float('inf'),
+            'r2': 0.0,
+            'pearson': 0.0,
+            'pert_r2': 0.0
+        }
+    
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_predictions = np.concatenate(all_predictions, axis=0)
+    
+    
+    all_predictions = np.nan_to_num(all_predictions, nan=0.0, posinf=10.0, neginf=-10.0)
+    all_targets = np.nan_to_num(all_targets, nan=0.0, posinf=10.0, neginf=-10.0)
+    
+    r2 = r2_score(all_targets, all_predictions)
+    if np.isnan(r2) or np.isinf(r2):
+        r2 = 0.0
+    pred_flat = all_predictions.flatten()
+    true_flat = all_targets.flatten()
+    if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
+        pearson = pearsonr(true_flat, pred_flat)[0]
+        if np.isnan(pearson) or np.isinf(pearson):
             pearson = 0.0
     else:
-        r2 = 0.0
         pearson = 0.0
+    if len(all_perts) > 0:
+        all_perts = np.concatenate(all_perts, axis=0)
+        all_pert_preds = np.concatenate(all_pert_preds, axis=0)
+        
+        all_pert_preds = np.nan_to_num(all_pert_preds, nan=0.0, posinf=1.0, neginf=-1.0)
+        pert_r2 = r2_score(all_perts, all_pert_preds)
+        if np.isnan(pert_r2) or np.isinf(pert_r2):
+            pert_r2 = 0.0
+    else:
+        pert_r2 = 0.0
     return {
-        'loss': total_loss / len(test_loader),
+        'loss': total_loss / valid_batches if valid_batches > 0 else float('inf'),
         'r2': r2,
-        'pearson': pearson
+        'pearson': pearson,
+        'pert_r2': pert_r2
     }
-def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None, perturbations=None):
+def calculate_metrics(pred, true, control_baseline=None, perturbations=None):
     n_samples, n_genes = true.shape
     mse = np.mean((pred - true) ** 2)
-    true_mean_per_gene = np.mean(true, axis=0)  
-    pred_mean_per_gene = np.mean(pred, axis=0)  
-    true_centered = true - true_mean_per_gene  
-    pred_centered = pred - pred_mean_per_gene  
-    numerator = np.sum(true_centered * pred_centered)
-    true_norm = np.sqrt(np.sum(true_centered ** 2))
-    pred_norm = np.sqrt(np.sum(pred_centered ** 2))
-    if true_norm > 1e-10 and pred_norm > 1e-10:
-        pcc = numerator / (true_norm * pred_norm)
+    pred_flat = pred.flatten()
+    true_flat = true.flatten()
+    if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
+        pcc = pearsonr(true_flat, pred_flat)[0]
         if np.isnan(pcc):
             pcc = 0.0
     else:
         pcc = 0.0
-    true_mean_vector = np.mean(true, axis=0)  
-    ss_res = np.sum((true - pred) ** 2)  
-    ss_tot = np.sum((true - true_mean_vector) ** 2)  
+    true_mean_overall = np.mean(true)
+    ss_res = np.sum((true - pred) ** 2)
+    ss_tot = np.sum((true - true_mean_overall) ** 2)
     if ss_tot > 1e-10:
         r2 = 1.0 - (ss_res / ss_tot)
     else:
         r2 = 0.0
     if np.isnan(r2):
         r2 = 0.0
-    if de_genes is not None:
-        de_mask = np.zeros(n_genes, dtype=bool)
-        de_mask[de_genes] = True
-        if np.any(de_mask):
-            mse_de = np.mean((pred[:, de_mask] - true[:, de_mask]) ** 2)
-            true_de = true[:, de_mask]  
-            pred_de = pred[:, de_mask]  
-            true_de_mean_per_gene = np.mean(true_de, axis=0)  
-            pred_de_mean_per_gene = np.mean(pred_de, axis=0)  
-            true_de_centered = true_de - true_de_mean_per_gene
-            pred_de_centered = pred_de - pred_de_mean_per_gene
-            numerator_de = np.sum(true_de_centered * pred_de_centered)
-            true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
-            pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
-            if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
-                pcc_de = numerator_de / (true_de_norm * pred_de_norm)
-                if np.isnan(pcc_de):
-                    pcc_de = 0.0
-            else:
-                pcc_de = 0.0
-            true_de_mean_vector = np.mean(true_de, axis=0)  
-            ss_res_de = np.sum((true_de - pred_de) ** 2)
-            ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
-            if ss_tot_de > 1e-10:
-                r2_de = 1.0 - (ss_res_de / ss_tot_de)
-            else:
-                r2_de = 0.0
-            if np.isnan(r2_de):
-                r2_de = 0.0
-        else:
-            mse_de = pcc_de = r2_de = np.nan
-    elif control_baseline is not None and control_baseline.shape[0] > 0:
+    if control_baseline is not None and control_baseline.shape[0] > 0:
         epsilon = 1e-8
         if perturbations is not None and len(perturbations) == n_samples:
             pert_indices = np.argmax(perturbations, axis=1)
@@ -715,22 +626,17 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None,
                     true_de = true_pert[:, de_mask]
                     pred_de = pred_pert[:, de_mask]
                     mse_de_pert = np.mean((pred_de - true_de) ** 2)
-                    true_de_mean_per_gene = np.mean(true_de, axis=0)
-                    pred_de_mean_per_gene = np.mean(pred_de, axis=0)
-                    true_de_centered = true_de - true_de_mean_per_gene
-                    pred_de_centered = pred_de - pred_de_mean_per_gene
-                    numerator_de = np.sum(true_de_centered * pred_de_centered)
-                    true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
-                    pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
-                    if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
-                        pcc_de_pert = numerator_de / (true_de_norm * pred_de_norm)
+                    pred_de_flat = pred_de.flatten()
+                    true_de_flat = true_de.flatten()
+                    if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                        pcc_de_pert = pearsonr(true_de_flat, pred_de_flat)[0]
                         if np.isnan(pcc_de_pert):
                             pcc_de_pert = 0.0
                     else:
                         pcc_de_pert = 0.0
-                    true_de_mean_vector = np.mean(true_de, axis=0)
+                    true_de_mean_overall = np.mean(true_de)
                     ss_res_de = np.sum((true_de - pred_de) ** 2)
-                    ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
+                    ss_tot_de = np.sum((true_de - true_de_mean_overall) ** 2)
                     if ss_tot_de > 1e-10:
                         r2_de_pert = 1.0 - (ss_res_de / ss_tot_de)
                     else:
@@ -752,35 +658,24 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None,
         std = np.std(true, axis=0)
         de_mask = np.abs(true - np.mean(true, axis=0)) > std
         if np.any(de_mask):
-            de_genes_indices = np.where(np.any(de_mask, axis=0))[0]  
-            if len(de_genes_indices) > 0:
-                true_de = true[:, de_genes_indices]  
-                pred_de = pred[:, de_genes_indices]  
-                mse_de = np.mean((pred_de - true_de) ** 2)
-                true_de_mean_per_gene = np.mean(true_de, axis=0)  
-                pred_de_mean_per_gene = np.mean(pred_de, axis=0)  
-                true_de_centered = true_de - true_de_mean_per_gene
-                pred_de_centered = pred_de - pred_de_mean_per_gene
-                numerator_de = np.sum(true_de_centered * pred_de_centered)
-                true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
-                pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
-                if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
-                    pcc_de = numerator_de / (true_de_norm * pred_de_norm)
-                    if np.isnan(pcc_de):
-                        pcc_de = 0.0
-                else:
+            mse_de = np.mean((pred[de_mask] - true[de_mask]) ** 2)
+            pred_de_flat = pred[de_mask].flatten()
+            true_de_flat = true[de_mask].flatten()
+            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
+                if np.isnan(pcc_de):
                     pcc_de = 0.0
-                true_de_mean_vector = np.mean(true_de, axis=0)  
-                ss_res_de = np.sum((true_de - pred_de) ** 2)
-                ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
-                if ss_tot_de > 1e-10:
-                    r2_de = 1.0 - (ss_res_de / ss_tot_de)
-                else:
-                    r2_de = 0.0
-                if np.isnan(r2_de):
-                    r2_de = 0.0
             else:
-                mse_de = pcc_de = r2_de = np.nan
+                pcc_de = 0.0
+            true_de_mean = np.mean(true[de_mask])
+            ss_res_de = np.sum((pred[de_mask] - true[de_mask]) ** 2)
+            ss_tot_de = np.sum((true[de_mask] - true_de_mean) ** 2)
+            if ss_tot_de > 1e-10:
+                r2_de = 1.0 - (ss_res_de / ss_tot_de)
+            else:
+                r2_de = 0.0
+            if np.isnan(r2_de):
+                r2_de = 0.0
         else:
             mse_de = pcc_de = r2_de = np.nan
     return {
@@ -791,154 +686,52 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None,
         'PCC_DE': pcc_de,
         'R2_DE': r2_de
     }
-def objective(trial, timestamp):
-    global train_dataset, test_dataset, device, pca_model, scaler, test_adata
-    params = {
-        'latent_dim': trial.suggest_categorical('latent_dim', [64, 128, 256]),
-        'chem_dim': trial.suggest_categorical('chem_dim', [32, 64, 128]),
-        'hidden_dim': trial.suggest_categorical('hidden_dim', [256, 512, 768, 1024]),
-        'n_layers': trial.suggest_int('n_layers', 2, 4),
-        'n_heads': trial.suggest_categorical('n_heads', [4, 8, 16]),
-        'dropout': trial.suggest_float('dropout', 0.1, 0.3),
-        'ot_eps': trial.suggest_float('ot_eps', 0.05, 0.2),
-        'ot_max_iter': trial.suggest_int('ot_max_iter', 30, 100),
-        'flow_layers': trial.suggest_int('flow_layers', 4, 8),
-        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-3, log=True),
-        'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-4, log=True),
-        'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128, 256]),
-        'alpha': trial.suggest_float('alpha', 0.5, 2.0),
-        'beta': trial.suggest_float('beta', 0.1, 1.0),
-        'gamma': trial.suggest_float('gamma', 0.05, 0.2),
-        'eta': trial.suggest_float('eta', 0.1, 1.0)
-    }
-    while params['hidden_dim'] % params['n_heads'] != 0:
-        if params['hidden_dim'] < 1024:
-            params['hidden_dim'] += params['n_heads']
-        else:
-            params['hidden_dim'] = 512
-    test_perturbation_names = list(test_adata.obs['perturbation'].unique())
-    max_pert_dim, all_pert_names = standardize_perturbation_encoding(
-        train_dataset, test_dataset=None, test_perturbation_names=test_perturbation_names)
-    n_genes = train_dataset.n_genes
-    print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
-    model = CondOTGRNModel(
-        input_dim=n_genes,  
-        output_dim=n_genes,  
-        pert_dim=max_pert_dim,
-        dose_dim=1,
-        latent_dim=params['latent_dim'],
-        chem_dim=params['chem_dim'],
-        hidden_dim=params['hidden_dim'],
-        n_layers=params['n_layers'],
-        n_heads=params['n_heads'],
-        dropout=params['dropout'],
-        ot_eps=params['ot_eps'],
-        ot_max_iter=params['ot_max_iter'],
-        flow_layers=params['flow_layers']
-    ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=params['learning_rate'],
-        weight_decay=params['weight_decay']
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-6
-    )
-    train_size = int(0.8 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
-    train_loader = DataLoader(
-        train_subset,
-        batch_size=params['batch_size'],
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=params['batch_size'],
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-    best_val_loss = float('inf')
-    patience = 15
-    patience_counter = 0
-    max_epochs = 100
-    loss_weights = {
-        'recon': params['alpha'],
-        'ot': params['beta'],
-        'flow': params['gamma'],
-        'de': params['eta'],
-        'grn': 0.01,
-        'reg': 1e-5
-    }
-    for epoch in range(max_epochs):
-        train_loss = train_model(
-            model, train_loader, optimizer, scheduler, device, loss_weights)
-        val_metrics = evaluate_model(model, val_loader, device, loss_weights)
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            patience_counter = 0
-            torch.save(model.state_dict(),
-                       f'best_model_trial_{trial.number}_{timestamp}.pt')
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                break
-        trial.report(val_metrics['loss'], epoch)
-        if trial.should_prune():
-            raise optuna.exceptions.TrialPruned()
-    return best_val_loss
-def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None, best_params=None):
+def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusion_best.pt',
+                            common_genes_info=None, pca_model=None, scaler=None, best_params=None):
     model.eval()
     all_predictions = []
     all_targets = []
-    all_perturbations = []
-    all_baselines = []  
+    all_baselines = []
+    all_perts = []
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
-            x_baseline, pert, dose, x_target_delta, x_target_pca = batch
-            x_baseline, pert, dose, x_target_delta, x_target_pca = x_baseline.to(
-                device), pert.to(device), dose.to(device), x_target_delta.to(device), x_target_pca.to(device)
-            outputs = model(x_baseline, pert, dose, is_training=False)
-            x_pred_delta = outputs['x_pred']  
-            x_pred_abs = x_baseline + x_pred_delta
-            x_target_abs = x_baseline + x_target_delta  
+            x_baseline, pert, x_target_delta = batch
+            x_baseline, pert, x_target_delta = x_baseline.to(
+                device), pert.to(device), x_target_delta.to(device)
+            x_pred_abs = model.p_sample_loop_from_baseline(x_baseline, pert, is_train=False)
+            x_target_abs = x_baseline + x_target_delta
             all_predictions.append(x_pred_abs.cpu().numpy())
             all_targets.append(x_target_abs.cpu().numpy())
-            all_perturbations.append(pert.cpu().numpy())
             all_baselines.append(x_baseline.cpu().numpy())
+            all_perts.append(pert.cpu().numpy())
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
-    all_perturbations = np.concatenate(all_perturbations, axis=0)
     all_baselines = np.concatenate(all_baselines, axis=0)
-    control_baseline = all_baselines  
-    results = calculate_detailed_metrics(all_predictions, all_targets, control_baseline=control_baseline, perturbations=all_perturbations)
+    all_perts = np.concatenate(all_perts, axis=0)
+    control_baseline = all_baselines
+    results = calculate_metrics(all_predictions, all_targets, control_baseline=control_baseline, perturbations=all_perts)
     torch.save({
         'model_state_dict': model.state_dict(),
         'evaluation_results': results,
         'predictions': all_predictions,
         'targets': all_targets,
-        'perturbations': all_perturbations,
         'baselines': all_baselines,
         'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
         'pca_model': pca_model,
         'scaler': scaler,
         'best_params': best_params,
         'model_config': {
-            'input_dim': model.input_dim,
-            'pert_dim': train_dataset.perturbations.shape[1],
-            'dose_dim': 1,
-            'latent_dim': model.latent_dim,
-            'chem_dim': model.chem_dim,
-            'hidden_dim': model.gene_encoder.input_proj.out_features,
-            'n_layers': len([m for m in model.gene_encoder.mlp if isinstance(m, nn.Linear)]) // 2 if hasattr(model.gene_encoder, 'mlp') else 2,
-            'n_heads': 8,  
-            'dropout': model.gene_encoder.output_proj[3].p if len(model.gene_encoder.output_proj) > 3 else 0.1,
-            'ot_eps': model.conditional_ot.eps,
-            'ot_max_iter': model.conditional_ot.max_iter,
-            'flow_layers': len(model.flow_refiner.coupling_layers)
+            'input_dim': model.input_dim,   
+            'output_dim': model.model.output_dim,
+            'train_pert_dim': model.model.train_pert_dim,
+            'test_pert_dim': model.model.test_pert_dim,
+            'hidden_dim': getattr(model.model, 'hidden_dim', 512),
+            'n_layers': getattr(model.model, 'n_layers', 4),
+            'n_heads': getattr(model.model, 'n_heads', 8),
+            'dropout': getattr(model.model, 'dropout', 0.1),
+            'diffusion_steps': getattr(model, 'diffusion_steps', 1000),
+            'time_emb_dim': model.model.time_emb_dim,
+            'pert_emb_dim': model.model.pert_emb_dim
         }
     }, save_path)
     metrics_df = pd.DataFrame({
@@ -951,55 +744,6 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
           float_format=lambda x: '{:.6f}'.format(x)))
     print(f"\nModel and evaluation results saved to: {save_path}")
     return results
-def load_model_for_analysis(model_path, device='cuda'):
-    print_log(f"Loading model from {model_path}")
-    checkpoint = torch.load(
-        model_path, map_location=device, weights_only=False)
-    model_state = checkpoint['model_state_dict']
-    predictions = checkpoint['predictions']
-    targets = checkpoint['targets']
-    perturbations = checkpoint.get('perturbations', None)
-    gene_names = checkpoint['gene_names']
-    pca_model = checkpoint['pca_model']
-    scaler = checkpoint['scaler']
-    model_config = checkpoint['model_config']
-    evaluation_results = checkpoint['evaluation_results']
-    class DummyModel:
-        def __init__(self):
-            self.eval = lambda: None
-    model = DummyModel()
-    print_log(f"Model loaded successfully!")
-    print_log(f"Gene names: {len(gene_names) if gene_names else 'None'}")
-    print_log(f"Predictions shape: {predictions.shape}")
-    print_log(f"Targets shape: {targets.shape}")
-    return {
-        'model': model,
-        'predictions': predictions,
-        'targets': targets,
-        'perturbations': perturbations,
-        'gene_names': gene_names,
-        'pca_model': pca_model,
-        'scaler': scaler,
-        'model_config': model_config,
-        'evaluation_results': evaluation_results
-    }
-def create_anndata_for_analysis(predictions, targets, gene_names, perturbations=None):
-    import anndata as ad
-    pred_adata = ad.AnnData(X=predictions)
-    pred_adata.var_names = gene_names
-    pred_adata.var['feature_types'] = 'Gene Expression'
-    target_adata = ad.AnnData(X=targets)
-    target_adata.var_names = gene_names
-    target_adata.var['feature_types'] = 'Gene Expression'
-    if perturbations is not None:
-        pred_adata.obs['perturbation'] = perturbations
-        target_adata.obs['perturbation'] = perturbations
-    pred_adata.obs['sample_type'] = 'predicted'
-    target_adata.obs['sample_type'] = 'observed'
-    print_log(f"Created AnnData objects:")
-    print_log(f"  Predictions: {pred_adata.shape}")
-    print_log(f"  Targets: {target_adata.shape}")
-    return pred_adata, target_adata
 def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=None):
     if test_dataset is not None:
         if hasattr(train_dataset, '_pert_encoding_standardized') and hasattr(test_dataset, '_pert_encoding_standardized'):
@@ -1043,71 +787,178 @@ def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_per
         f"Standardized perturbation encoding: {actual_pert_dim} dimensions")
     print_log(f"All perturbation types: {all_pert_names}")
     return actual_pert_dim, all_pert_names
-def perform_downstream_analysis(model_path: str,
-                                output_dir: str = './analysis_results',
-                                device: str = 'cuda') -> Dict:
-    try:
-        from downstream_analysis import analyze_model_results
-        return analyze_model_results(model_path, output_dir, device)
-    except ImportError:
-        print_log(
-            "Warning: downstream_analysis module not found. Using basic analysis.")
-        results = load_model_for_analysis(model_path, device)
-        pred_adata, target_adata = create_anndata_for_analysis(
-            results['predictions'],
-            results['targets'],
-            results['gene_names'],
-            results['perturbations']
-        )
-        return {
-            'model_results': results,
-            'pred_adata': pred_adata,
-            'target_adata': target_adata,
-            'message': 'Basic analysis completed. Install downstream_analysis for full functionality.'
-        }
+def objective(trial, timestamp):
+    global train_dataset, test_dataset, device, pca_model, test_adata
+    params = {
+        'pca_dim': 128,
+        'n_hidden': trial.suggest_int('n_hidden', 256, 1024),
+        'n_layers': trial.suggest_int('n_layers', 2, 6),
+        'n_heads': trial.suggest_int('n_heads', 4, 8),
+        'dropout': trial.suggest_float('dropout', 0.1, 0.3),
+        'aux_weight': trial.suggest_float('aux_weight', 0.05, 0.15),
+        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-3, log=True),
+        'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-4, log=True),
+        'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128]),
+        'time_emb_dim': trial.suggest_int('time_emb_dim', 64, 256),
+        'pert_emb_dim': trial.suggest_int('pert_emb_dim', 32, 128),
+        'diffusion_steps': trial.suggest_categorical('diffusion_steps', [500, 1000, 2000])
+    }
+    if test_adata is not None:
+        test_perturbation_names = list(test_adata.obs['perturbation'].unique())
+    else:
+        
+        if test_dataset is not None and hasattr(test_dataset, 'perturbation_names'):
+            test_perturbation_names = test_dataset.perturbation_names
+        else:
+            
+            test_perturbation_names = train_dataset.perturbation_names if hasattr(train_dataset, 'perturbation_names') else []
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=test_perturbation_names)
+    n_genes = train_dataset.n_genes
+    print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
+    base_model = ConditionalDiffusionModel(
+        input_dim=n_genes,
+        output_dim=n_genes,
+        train_pert_dim=pert_dim,
+        test_pert_dim=pert_dim,
+        hidden_dim=params['n_hidden'],
+        n_layers=params['n_layers'],
+        n_heads=params['n_heads'],
+        dropout=params['dropout'],
+        time_emb_dim=params['time_emb_dim'],
+        pert_emb_dim=params['pert_emb_dim']
+    )
+    model = DiffusionModel(
+        base_model, diffusion_steps=params['diffusion_steps']).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=params['learning_rate'],
+        weight_decay=params['weight_decay']
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=10,
+        T_mult=2,
+        eta_min=1e-6
+    )
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=params['batch_size'],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=params['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    best_val_loss = float('inf')
+    patience = 15
+    patience_counter = 0
+    max_epochs = 150
+    for epoch in range(max_epochs):
+        model.train()
+        train_loss = 0
+        for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{max_epochs}'):
+            x_baseline, pert, x_target_delta = batch
+            x_baseline, pert, x_target_delta = x_baseline.to(
+                device), pert.to(device), x_target_delta.to(device)
+            x_target_abs = x_baseline + x_target_delta
+            optimizer.zero_grad()
+            pred_noise, pert_pred, noise, t = model(
+                x_target_abs, pert, is_train=True)
+            diffusion_loss = F.mse_loss(pred_noise, noise)
+            pert_loss = F.mse_loss(pert_pred, pert)
+            loss = diffusion_loss + params['aux_weight'] * pert_loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+        model.eval()
+        val_loss = 0
+        val_batches_processed = 0
+        max_val_batches = 50
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f'Validation Epoch {epoch+1}', leave=False):
+                if val_batches_processed >= max_val_batches:
+                    break
+                x_baseline, pert, x_target_delta = batch
+                x_baseline, pert, x_target_delta = x_baseline.to(
+                    device), pert.to(device), x_target_delta.to(device)
+                x_pred_abs = model.p_sample_loop_from_baseline(x_baseline, pert, is_train=False)
+                x_target_abs = x_baseline + x_target_delta
+                diffusion_loss = F.mse_loss(x_pred_abs, x_target_abs)
+                t_dummy = torch.randint(0, model.diffusion_steps, (x_baseline.shape[0],), device=device)
+                _, pert_pred, _ = model.model(x_pred_abs, pert, t_dummy, is_train=False)
+                pert_loss = F.mse_loss(pert_pred, pert)
+                loss = diffusion_loss + params['aux_weight'] * pert_loss
+                val_loss += loss.item()
+                val_batches_processed += 1
+        val_loss /= val_batches_processed
+        scheduler.step()
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(),
+                       f'best_model_trial_{trial.number}_{timestamp}.pt')
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'Early stopping at epoch {epoch+1}')
+                break
+        print(
+            f'Epoch {epoch+1}/{max_epochs} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f}')
+    return best_val_loss
 def main(gpu_id=None):
     set_global_seed(42)
-    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler
+    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print_log(f'Training started at: {timestamp}')
+    print(f'Training started at: {timestamp}')
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
-        print_log(f'Available GPUs: {gpu_count}')
+        print(f'Available GPUs: {gpu_count}')
         if gpu_id is not None:
             if gpu_id >= gpu_count:
-                print_log(
-                    f'Warning: Specified GPU {gpu_id} does not exist, using GPU 0')
+                print(
+                    f'Warning: Specified GPU {gpu_id} not available, using GPU 0')
                 gpu_id = 0
             device = torch.device(f'cuda:{gpu_id}')
-            print_log(f'Using specified GPU {gpu_id}: {device}')
+            print(f'Using specified GPU {gpu_id}: {device}')
         else:
             device = torch.device('cuda:0')
-            print_log(f'Using default GPU 0: {device}')
+            print(f'Using default GPU 0: {device}')
     else:
         device = torch.device('cpu')
-        print_log('CUDA not available, using CPU')
-    print_log('Loading data...')
-    train_path = "/datasets/SrivatsanTrapnell2020_train_filtered2.h5ad"
-    test_path = "/datasets/SrivatsanTrapnell2020_test_filtered2.h5ad"
+        print('CUDA not available, using CPU')
+    print('Loading ATAC data...')
+    train_path = "/datasets/LiscovitchBrauerSanjana2021_train_filtered2.h5ad"
+    test_path = "/datasets/LiscovitchBrauerSanjana2021_test_filtered2.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")
     train_adata = sc.read_h5ad(train_path)
     test_adata = sc.read_h5ad(test_path)
-    print_log(f'Training data shape: {train_adata.shape}')
-    print_log(f'Test data shape: {test_adata.shape}')
-    print_log("Processing gene set consistency...")
+    print(f'Train data shape: {train_adata.shape}')
+    print(f'Test data shape: {test_adata.shape}')
+    print("Processing gene set consistency...")
     train_genes = set(train_adata.var_names)
     test_genes = set(test_adata.var_names)
     common_genes = list(train_genes & test_genes)
-    print_log(f"Training genes: {len(train_genes)}")
-    print_log(f"Test genes: {len(test_genes)}")
-    print_log(f"Common genes: {len(common_genes)}")
+    print(f"Train genes: {len(train_genes)}")
+    print(f"Test genes: {len(test_genes)}")
+    print(f"Common genes: {len(common_genes)}")
     common_genes.sort()
     train_gene_idx = [train_adata.var_names.get_loc(
         gene) for gene in common_genes]
     test_gene_idx = [test_adata.var_names.get_loc(
         gene) for gene in common_genes]
+    pca_model = None
     if scipy.sparse.issparse(train_adata.X):
         train_data = train_adata.X[:, train_gene_idx].toarray()
     else:
@@ -1119,49 +970,32 @@ def main(gpu_id=None):
     train_data = scaler.fit_transform(train_data)
     train_data = np.clip(train_data, -10, 10)
     train_data = train_data / 10.0
-    pca_model = None
-    print_log("=" * 60)
-    print_log("CRITICAL: Training in FULL GENE SPACE")
-    print_log(f"Gene count: {len(common_genes)}")
-    print_log("Model will use input_proj to project to internal working dimension")
-    print_log("=" * 60)
     common_genes_info = {
         'genes': common_genes,
         'train_idx': train_gene_idx,
         'test_idx': test_gene_idx
     }
-    train_pert_col = train_adata.obs['perturbation'].astype(str)
-    train_pert_counts = train_pert_col.value_counts()
-    has_control = train_pert_col.str.lower().isin(['control', 'ctrl']).any() or \
-                  train_pert_col.str.contains('NegCtrl', case=False, na=False).any()
-    reference_pert = None
-    if not has_control:
-        reference_pert = train_pert_counts.index[0]
-    train_dataset = GeneExpressionDataset(
+    train_dataset = ATACDataset(
         train_adata,
         perturbation_key='perturbation',
-        dose_key='dose_value',
         scaler=scaler,
-        pca_model=None,  
+        pca_model=None,
         pca_dim=128,
         fit_pca=False,
         augment=True,
         is_train=True,
-        common_genes_info=common_genes_info,
-        reference_perturbation=reference_pert
+        common_genes_info=common_genes_info
     )
-    test_dataset = GeneExpressionDataset(
+    test_dataset = ATACDataset(
         test_adata,
         perturbation_key='perturbation',
-        dose_key='dose_value',
         scaler=scaler,
-        pca_model=None, 
+        pca_model=None,
         pca_dim=128,
         fit_pca=False,
         augment=False,
         is_train=False,
-        common_genes_info=common_genes_info,
-        reference_perturbation=reference_pert  
+        common_genes_info=common_genes_info
     )
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
@@ -1169,42 +1003,30 @@ def main(gpu_id=None):
         sampler=optuna.samplers.TPESampler(seed=42),
         pruner=optuna.pruners.MedianPruner(
             n_startup_trials=5,
-            n_warmup_steps=10,
+            n_warmup_steps=5,
             interval_steps=1
         )
     )
-    print_log('Starting hyperparameter optimization...')
-    trials = 50
-    with tqdm(total=trials, desc="Hyperparameter Optimization") as pbar:
-        def objective_with_progress(trial):
-            result = objective(trial, timestamp)
-            pbar.update(1)
-            pbar.set_postfix({
-                'trial': trial.number,
-                'value': f"{result:.4f}" if result is not None else "pruned"
-            })
-            return result
-        study.optimize(objective_with_progress, n_trials=trials)
-    max_pert_dim, all_pert_names = standardize_perturbation_encoding(
-        train_dataset, test_dataset)
+    print('Starting hyperparameter optimization...')
+    study.optimize(lambda trial: objective(trial, timestamp), n_trials=50)
+    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
+    best_params = study.best_params
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
-    best_params = study.best_params
-    final_model = CondOTGRNModel(
-        input_dim=n_genes,  
-        output_dim=n_genes,  
-        pert_dim=max_pert_dim,
-        dose_dim=1,
-        latent_dim=best_params['latent_dim'],
-        chem_dim=best_params['chem_dim'],
-        hidden_dim=best_params['hidden_dim'],
+    base_model = ConditionalDiffusionModel(
+        input_dim=n_genes,
+        output_dim=n_genes,
+        train_pert_dim=pert_dim,
+        test_pert_dim=pert_dim,
+        hidden_dim=best_params['n_hidden'],
         n_layers=best_params['n_layers'],
         n_heads=best_params['n_heads'],
         dropout=best_params['dropout'],
-        ot_eps=best_params['ot_eps'],
-        ot_max_iter=best_params['ot_max_iter'],
-        flow_layers=best_params['flow_layers']
-    ).to(device)
+        time_emb_dim=best_params['time_emb_dim'],
+        pert_emb_dim=best_params['pert_emb_dim']
+    )
+    final_model = DiffusionModel(
+        base_model, diffusion_steps=best_params['diffusion_steps']).to(device)
     train_size = int(0.8 * len(train_dataset))
     val_size = len(train_dataset) - train_size
     train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
@@ -1235,57 +1057,50 @@ def main(gpu_id=None):
         weight_decay=best_params['weight_decay']
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+        optimizer,
+        T_0=10,
+        T_mult=2,
+        eta_min=1e-6
     )
-    print_log('Training final model...')
+    print('Training final model...')
     best_loss = float('inf')
     best_model = None
-    max_epochs = 200
-    patience = 20
+    max_epochs = 300
+    patience = 25
     patience_counter = 0
-    loss_weights = {
-        'recon': best_params['alpha'],
-        'ot': best_params['beta'],
-        'flow': best_params['gamma'],
-        'de': best_params['eta'],
-        'grn': 0.01,
-        'reg': 1e-5
-    }
     for epoch in range(max_epochs):
-        train_loss = train_model(
-            final_model, train_loader, optimizer, scheduler, device, loss_weights)
-        val_metrics = evaluate_model(
-            final_model, val_loader, device, loss_weights)
-        if (epoch + 1) % 20 == 0:
-            print_log(f'Epoch {epoch+1}/{max_epochs}:')
-            print_log(f'Training Loss: {train_loss:.4f}')
-            print_log(f'Validation Loss: {val_metrics["loss"]:.4f}')
+        train_loss = train_model(final_model, train_loader, optimizer, scheduler, device,
+                                 aux_weight=best_params['aux_weight'])
+        val_metrics = evaluate_model(final_model, val_loader, device,
+                                      aux_weight=best_params['aux_weight'])
+        if (epoch + 1) % 30 == 0:
+            print(f'Epoch {epoch+1}/{max_epochs}:')
+            print(f'Training Loss: {train_loss:.4f}')
+            print(f'Validation Loss: {val_metrics["loss"]:.4f}')
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
             patience_counter = 0
             best_model = final_model.state_dict()
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': final_model.state_dict(),
+                'model_state_dict': best_model,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
                 'metrics': val_metrics,
                 'best_params': best_params
-            }, f'condot_grn_best_model_{timestamp}.pt')
-            print_log(f"Saved best model with validation loss: {best_loss:.4f}")
+            }, f'atac_diffusion_best_model_{timestamp}.pt')
+            print(f"Saved best model with validation loss: {best_loss:.4f}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print_log(f'Early stopping at epoch {epoch+1}')
+                print(f'Early stopping at epoch {epoch+1}')
                 break
     final_model.load_state_dict(best_model)
-    print_log('Evaluating final model on test set...')
-    results = evaluate_and_save_model(
-        final_model, test_loader, device,
-        f'condot_grn_final_model_{timestamp}.pt',
-        common_genes_info, pca_model, scaler, best_params
-    )
+    print('Evaluating final model on test set...')
+    results = evaluate_and_save_model(final_model, test_loader, device,
+                                      f'atac_diffusion_final_model_{timestamp}.pt',
+                                      common_genes_info, pca_model, scaler, best_params)
     best_params_str = str(best_params)
     if len(best_params_str) > 50:
         best_params_str = best_params_str[:50] + '...'
@@ -1296,38 +1111,73 @@ def main(gpu_id=None):
         'Best_Params': [best_params_str] * 6
     })
     results_df.to_csv(
-        f'condot_grn_evaluation_results_{timestamp}.csv', index=False)
+        f'atac_diffusion_evaluation_results_{timestamp}.csv', index=False)
     print_log("\nFinal Evaluation Results:")
-    print_log(results_df.to_string(index=False,
-          float_format=lambda x: '{:.6f}'.format(x)))
+    print_log(results_df.to_string(index=False, float_format=lambda x: '{:.6f}'.format(x)))
     return results_df
+def load_model_for_prediction(model_path, device='cuda'):
+    print(f"Loading model from {model_path}")
+    checkpoint = torch.load(
+        model_path, map_location=device, weights_only=False)
+    model_state = checkpoint['model_state_dict']
+    predictions = checkpoint['predictions']
+    targets = checkpoint['targets']
+    gene_names = checkpoint['gene_names']
+    pca_model = checkpoint['pca_model']
+    scaler = checkpoint['scaler']
+    model_config = checkpoint['model_config']
+    evaluation_results = checkpoint['evaluation_results']
+    output_dim = model_config.get('output_dim', model_config['input_dim'])
+    base_model = ConditionalDiffusionModel(
+        input_dim=model_config['input_dim'],
+        output_dim=output_dim,
+        train_pert_dim=model_config['train_pert_dim'],
+        test_pert_dim=model_config['test_pert_dim'],
+        hidden_dim=model_config['hidden_dim'],
+        n_layers=model_config['n_layers'],
+        n_heads=model_config['n_heads'],
+        dropout=model_config['dropout']
+    )
+    model = DiffusionModel(
+        base_model, diffusion_steps=model_config['diffusion_steps']).to(device)
+    model.load_state_dict(model_state)
+    model.eval()
+    print(f"Model loaded successfully!")
+    print(f"Gene names: {len(gene_names) if gene_names else 'None'}")
+    print(f"Predictions shape: {predictions.shape}")
+    print(f"Targets shape: {targets.shape}")
+    return {
+        'model': model,
+        'predictions': predictions,
+        'targets': targets,
+        'gene_names': gene_names,
+        'pca_model': pca_model,
+        'scaler': scaler,
+        'model_config': model_config,
+        'evaluation_results': evaluation_results
+    }
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='CondOT-GRN Model Training for Drug Perturbation Prediction')
+        description='ATAC Conditional Diffusion Model Training')
     parser.add_argument('--gpu', type=int, default=None,
-                        help='Specify GPU ID to use (0-7, e.g., --gpu 0)')
+                        help='Specify GPU number to use (e.g., --gpu 0 for GPU 0, --gpu 1 for GPU 1)')
     parser.add_argument('--list-gpus', action='store_true',
                         help='List all available GPUs and exit')
-    parser.add_argument('--epochs', type=int, default=200,
-                        help='Number of training epochs (default: 200)')
-    parser.add_argument('--trials', type=int, default=50,
-                        help='Number of hyperparameter optimization trials (default: 50)')
     args = parser.parse_args()
     if args.list_gpus:
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
+            print(f'Available GPUs: {gpu_count}')
             for i in range(gpu_count):
                 print(f'GPU {i}: {torch.cuda.get_device_name(i)}')
         else:
             print('CUDA not available')
         exit(0)
-    print_log("=" * 80)
-    print_log("CondOT-GRN Model for Single-Cell Drug Perturbation Prediction")
-    print_log("=" * 80)
-    print_log(f"Epochs: {args.epochs}")
-    print_log(f"Hyperparameter optimization trials: {args.trials}")
+    print("=" * 60)
+    print("ATAC Conditional Diffusion Model Training")
+    print("=" * 60)
     if args.gpu is not None:
-        print_log(f"Using specified GPU: {args.gpu}")
+        print(f"Using specified GPU: {args.gpu}")
+    else:
+        print("Using default GPU settings")
     results_df = main(gpu_id=args.gpu)
-    print_log("Training completed successfully!")
-    print_log("=" * 80)
