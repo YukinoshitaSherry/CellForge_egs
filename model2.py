@@ -633,7 +633,7 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
         'r2': r2,
         'pearson': pearson
     }
-def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None):
+def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None, perturbations=None):
     n_samples, n_genes = true.shape
     mse = np.mean((pred - true) ** 2)
     true_mean_per_gene = np.mean(true, axis=0)  
@@ -691,40 +691,61 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None)
             mse_de = pcc_de = r2_de = np.nan
     elif control_baseline is not None and control_baseline.shape[0] > 0:
         epsilon = 1e-8
-        true_mean_pert = np.mean(true, axis=0)  
-        control_mean = np.mean(control_baseline, axis=0)  
-        lfc = np.log2((true_mean_pert + epsilon) / (control_mean + epsilon))
-        lfc_abs = np.abs(lfc)
-        K = min(20, n_genes)
-        top_k_indices = np.argsort(lfc_abs)[-K:]
-        de_mask = np.zeros(n_genes, dtype=bool)
-        de_mask[top_k_indices] = True
-        if np.any(de_mask):
-            mse_de = np.mean((pred[:, de_mask] - true[:, de_mask]) ** 2)
-            true_de = true[:, de_mask]  
-            pred_de = pred[:, de_mask]  
-            true_de_mean_per_gene = np.mean(true_de, axis=0)  
-            pred_de_mean_per_gene = np.mean(pred_de, axis=0)  
-            true_de_centered = true_de - true_de_mean_per_gene
-            pred_de_centered = pred_de - pred_de_mean_per_gene
-            numerator_de = np.sum(true_de_centered * pred_de_centered)
-            true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
-            pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
-            if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
-                pcc_de = numerator_de / (true_de_norm * pred_de_norm)
-                if np.isnan(pcc_de):
-                    pcc_de = 0.0
+        if perturbations is not None and len(perturbations) == n_samples:
+            pert_indices = np.argmax(perturbations, axis=1)
+            unique_perts = np.unique(pert_indices)
+            mse_de_list = []
+            pcc_de_list = []
+            r2_de_list = []
+            for pert_idx in unique_perts:
+                pert_mask = pert_indices == pert_idx
+                if np.sum(pert_mask) < 2:
+                    continue
+                true_pert = true[pert_mask]
+                pred_pert = pred[pert_mask]
+                true_mean_pert = np.mean(true_pert, axis=0)
+                control_mean = np.mean(control_baseline, axis=0)
+                lfc = np.log2((true_mean_pert + epsilon) / (control_mean + epsilon))
+                lfc_abs = np.abs(lfc)
+                K = min(20, n_genes)
+                top_k_indices = np.argsort(lfc_abs)[-K:]
+                de_mask = np.zeros(n_genes, dtype=bool)
+                de_mask[top_k_indices] = True
+                if np.any(de_mask):
+                    true_de = true_pert[:, de_mask]
+                    pred_de = pred_pert[:, de_mask]
+                    mse_de_pert = np.mean((pred_de - true_de) ** 2)
+                    true_de_mean_per_gene = np.mean(true_de, axis=0)
+                    pred_de_mean_per_gene = np.mean(pred_de, axis=0)
+                    true_de_centered = true_de - true_de_mean_per_gene
+                    pred_de_centered = pred_de - pred_de_mean_per_gene
+                    numerator_de = np.sum(true_de_centered * pred_de_centered)
+                    true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
+                    pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
+                    if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
+                        pcc_de_pert = numerator_de / (true_de_norm * pred_de_norm)
+                        if np.isnan(pcc_de_pert):
+                            pcc_de_pert = 0.0
+                    else:
+                        pcc_de_pert = 0.0
+                    true_de_mean_vector = np.mean(true_de, axis=0)
+                    ss_res_de = np.sum((true_de - pred_de) ** 2)
+                    ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
+                    if ss_tot_de > 1e-10:
+                        r2_de_pert = 1.0 - (ss_res_de / ss_tot_de)
+                    else:
+                        r2_de_pert = 0.0
+                    if np.isnan(r2_de_pert):
+                        r2_de_pert = 0.0
+                    mse_de_list.append(mse_de_pert)
+                    pcc_de_list.append(pcc_de_pert)
+                    r2_de_list.append(r2_de_pert)
+            if len(mse_de_list) > 0:
+                mse_de = np.mean(mse_de_list)
+                pcc_de = np.mean(pcc_de_list)
+                r2_de = np.mean(r2_de_list)
             else:
-                pcc_de = 0.0
-            true_de_mean_vector = np.mean(true_de, axis=0)  
-            ss_res_de = np.sum((true_de - pred_de) ** 2)
-            ss_tot_de = np.sum((true_de - true_de_mean_vector) ** 2)
-            if ss_tot_de > 1e-10:
-                r2_de = 1.0 - (ss_res_de / ss_tot_de)
-            else:
-                r2_de = 0.0
-            if np.isnan(r2_de):
-                r2_de = 0.0
+                mse_de = pcc_de = r2_de = np.nan
         else:
             mse_de = pcc_de = r2_de = np.nan
     else:
@@ -893,7 +914,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
     all_perturbations = np.concatenate(all_perturbations, axis=0)
     all_baselines = np.concatenate(all_baselines, axis=0)
     control_baseline = all_baselines  
-    results = calculate_detailed_metrics(all_predictions, all_targets, control_baseline=control_baseline)
+    results = calculate_detailed_metrics(all_predictions, all_targets, control_baseline=control_baseline, perturbations=all_perturbations)
     torch.save({
         'model_state_dict': model.state_dict(),
         'evaluation_results': results,

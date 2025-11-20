@@ -580,7 +580,7 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
         'pearson': pearson,
         'pert_r2': pert_r2
     }
-def calculate_metrics(pred, true, control_baseline=None):
+def calculate_metrics(pred, true, control_baseline=None, perturbations=None):
     n_samples, n_genes = true.shape
     mse = np.mean((pred - true) ** 2)
     pred_flat = pred.flatten()
@@ -602,33 +602,56 @@ def calculate_metrics(pred, true, control_baseline=None):
         r2 = 0.0
     if control_baseline is not None and control_baseline.shape[0] > 0:
         epsilon = 1e-8
-        true_mean_pert = np.mean(true, axis=0)
-        control_mean = np.mean(control_baseline, axis=0)
-        lfc = np.log2((true_mean_pert + epsilon) / (control_mean + epsilon))
-        lfc_abs = np.abs(lfc)
-        K = min(20, n_genes)
-        top_k_indices = np.argsort(lfc_abs)[-K:]
-        de_mask = np.zeros(n_genes, dtype=bool)
-        de_mask[top_k_indices] = True
-        if np.any(de_mask):
-            mse_de = np.mean((pred[:, de_mask] - true[:, de_mask]) ** 2)
-            pred_de_flat = pred[:, de_mask].flatten()
-            true_de_flat = true[:, de_mask].flatten()
-            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
-                pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
-                if np.isnan(pcc_de):
-                    pcc_de = 0.0
+        if perturbations is not None and len(perturbations) == n_samples:
+            pert_indices = np.argmax(perturbations, axis=1)
+            unique_perts = np.unique(pert_indices)
+            mse_de_list = []
+            pcc_de_list = []
+            r2_de_list = []
+            for pert_idx in unique_perts:
+                pert_mask = pert_indices == pert_idx
+                if np.sum(pert_mask) < 2:
+                    continue
+                true_pert = true[pert_mask]
+                pred_pert = pred[pert_mask]
+                true_mean_pert = np.mean(true_pert, axis=0)
+                control_mean = np.mean(control_baseline, axis=0)
+                lfc = np.log2((true_mean_pert + epsilon) / (control_mean + epsilon))
+                lfc_abs = np.abs(lfc)
+                K = min(20, n_genes)
+                top_k_indices = np.argsort(lfc_abs)[-K:]
+                de_mask = np.zeros(n_genes, dtype=bool)
+                de_mask[top_k_indices] = True
+                if np.any(de_mask):
+                    true_de = true_pert[:, de_mask]
+                    pred_de = pred_pert[:, de_mask]
+                    mse_de_pert = np.mean((pred_de - true_de) ** 2)
+                    pred_de_flat = pred_de.flatten()
+                    true_de_flat = true_de.flatten()
+                    if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                        pcc_de_pert = pearsonr(true_de_flat, pred_de_flat)[0]
+                        if np.isnan(pcc_de_pert):
+                            pcc_de_pert = 0.0
+                    else:
+                        pcc_de_pert = 0.0
+                    true_de_mean_overall = np.mean(true_de)
+                    ss_res_de = np.sum((true_de - pred_de) ** 2)
+                    ss_tot_de = np.sum((true_de - true_de_mean_overall) ** 2)
+                    if ss_tot_de > 1e-10:
+                        r2_de_pert = 1.0 - (ss_res_de / ss_tot_de)
+                    else:
+                        r2_de_pert = 0.0
+                    if np.isnan(r2_de_pert):
+                        r2_de_pert = 0.0
+                    mse_de_list.append(mse_de_pert)
+                    pcc_de_list.append(pcc_de_pert)
+                    r2_de_list.append(r2_de_pert)
+            if len(mse_de_list) > 0:
+                mse_de = np.mean(mse_de_list)
+                pcc_de = np.mean(pcc_de_list)
+                r2_de = np.mean(r2_de_list)
             else:
-                pcc_de = 0.0
-            true_de_mean_overall = np.mean(true[:, de_mask])
-            ss_res_de = np.sum((true[:, de_mask] - pred[:, de_mask]) ** 2)
-            ss_tot_de = np.sum((true[:, de_mask] - true_de_mean_overall) ** 2)
-            if ss_tot_de > 1e-10:
-                r2_de = 1.0 - (ss_res_de / ss_tot_de)
-            else:
-                r2_de = 0.0
-            if np.isnan(r2_de):
-                r2_de = 0.0
+                mse_de = pcc_de = r2_de = np.nan
         else:
             mse_de = pcc_de = r2_de = np.nan
     else:
@@ -669,6 +692,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusio
     all_predictions = []
     all_targets = []
     all_baselines = []
+    all_perts = []
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
             x_baseline, pert, x_target_delta = batch
@@ -679,11 +703,13 @@ def evaluate_and_save_model(model, test_loader, device, save_path='atac_diffusio
             all_predictions.append(x_pred_abs.cpu().numpy())
             all_targets.append(x_target_abs.cpu().numpy())
             all_baselines.append(x_baseline.cpu().numpy())
+            all_perts.append(pert.cpu().numpy())
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
     all_baselines = np.concatenate(all_baselines, axis=0)
+    all_perts = np.concatenate(all_perts, axis=0)
     control_baseline = all_baselines
-    results = calculate_metrics(all_predictions, all_targets, control_baseline=control_baseline)
+    results = calculate_metrics(all_predictions, all_targets, control_baseline=control_baseline, perturbations=all_perts)
     torch.save({
         'model_state_dict': model.state_dict(),
         'evaluation_results': results,
