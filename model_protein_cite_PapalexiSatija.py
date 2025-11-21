@@ -163,6 +163,9 @@ class CITEProteinDataset(Dataset):
         target_protein = self.protein_data[target_idx]
         perturbation = pair['perturbation']
         
+        # Calculate delta (change from baseline to target)
+        target_delta = target_protein - baseline_protein
+        
         if self.augment and self.training:
             noise = np.random.normal(0, 0.01, baseline_protein.shape)
             baseline_protein = baseline_protein + noise
@@ -173,7 +176,7 @@ class CITEProteinDataset(Dataset):
         
         return (torch.FloatTensor(baseline_protein), 
                 torch.FloatTensor(perturbation), 
-                torch.FloatTensor(target_protein))
+                torch.FloatTensor(target_delta))
 
 class GraphAttentionLayer(nn.Module):
     def __init__(self, in_dim, out_dim, n_heads=4, dropout=0.1):
@@ -437,18 +440,22 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
     
     with torch.no_grad():
         for batch in test_loader:
-            baseline_expr, pert, target_expr = batch
-            baseline_expr, pert, target_expr = baseline_expr.to(device), pert.to(device), target_expr.to(device)
+            baseline_expr, pert, target_delta = batch
+            baseline_expr, pert, target_delta = baseline_expr.to(device), pert.to(device), target_delta.to(device)
             
             output, pert_pred = model(baseline_expr, pert)
             
-            main_loss = F.mse_loss(output, target_expr)
+            # Compare delta predictions with target delta
+            main_loss = F.mse_loss(output, target_delta)
             aux_loss = F.mse_loss(pert_pred, pert)
             loss = main_loss + aux_weight * aux_loss
             
             total_loss += loss.item()
-            all_targets.append(target_expr.cpu().numpy())
-            all_predictions.append(output.cpu().numpy())
+            # Convert to absolute values for evaluation metrics
+            target_abs = baseline_expr + target_delta
+            pred_abs = baseline_expr + output
+            all_targets.append(target_abs.cpu().numpy())
+            all_predictions.append(pred_abs.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
             all_pert_preds.append(pert_pred.cpu().numpy())
     
@@ -750,13 +757,17 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
-            baseline_expr, pert, target_expr = batch
-            baseline_expr, pert, target_expr = baseline_expr.to(device), pert.to(device), target_expr.to(device)
+            baseline_expr, pert, target_delta = batch
+            baseline_expr, pert, target_delta = baseline_expr.to(device), pert.to(device), target_delta.to(device)
             
             output, _ = model(baseline_expr, pert)
             
-            all_predictions.append(output.cpu().numpy())
-            all_targets.append(target_expr.cpu().numpy())
+            # Convert to absolute values for evaluation
+            target_abs = baseline_expr + target_delta
+            pred_abs = baseline_expr + output
+            
+            all_predictions.append(pred_abs.cpu().numpy())
+            all_targets.append(target_abs.cpu().numpy())
             all_baselines.append(baseline_expr.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
     
