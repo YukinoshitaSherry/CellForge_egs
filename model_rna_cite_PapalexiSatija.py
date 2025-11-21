@@ -83,6 +83,7 @@ class CITERNADataset(Dataset):
                 self.scaler = StandardScaler()
                 data = self.scaler.fit_transform(data)
         else:
+            # Use provided scaler (fitted on training data only, no data leakage)
             self.scaler = scaler
             if not is_standardized_already:
                 data = self.scaler.transform(data)
@@ -167,6 +168,7 @@ class CITERNADataset(Dataset):
         baseline_expr = self.expression_data[pair['baseline_idx']]
         perturbed_expr = self.original_expression_data[pair['perturbed_idx']]
         perturbation = pair['perturbation']
+        # Calculate delta: change from baseline to perturbed target
         x_target_delta = perturbed_expr - baseline_expr
         if self.augment and self.training:
             noise = np.random.normal(0, 0.05, baseline_expr.shape)
@@ -309,8 +311,11 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
         baseline_expr, pert, target_expr = batch
         baseline_expr, pert, target_expr = baseline_expr.to(
             device), pert.to(device), target_expr.to(device)
+        # Model receives baseline and perturbation, outputs predicted delta
         output, pert_pred = model(baseline_expr, pert)
+        # Main loss: compare predicted delta with target delta
         main_loss = F.mse_loss(output, target_expr)
+        # Auxiliary loss: compare predicted perturbation with true perturbation
         aux_loss = F.mse_loss(pert_pred, pert)
         loss = main_loss + aux_weight * aux_loss
         loss = loss / accumulation_steps
@@ -334,11 +339,14 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
             baseline_expr, pert, target_expr = batch
             baseline_expr, pert, target_expr = baseline_expr.to(
                 device), pert.to(device), target_expr.to(device)
+            # Model receives baseline and perturbation, outputs predicted delta
             output, pert_pred = model(baseline_expr, pert)
+            # Loss computed on delta values
             main_loss = F.mse_loss(output, target_expr)
             aux_loss = F.mse_loss(pert_pred, pert)
             loss = main_loss + aux_weight * aux_loss
             total_loss += loss.item()
+            # Store delta values for metrics (r2, pearson computed on deltas)
             all_targets.append(target_expr.cpu().numpy())
             all_predictions.append(output.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
@@ -642,8 +650,13 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
             baseline_expr, pert, target_expr = baseline_expr.to(
                 device), pert.to(device), target_expr.to(device)
             output, _ = model(baseline_expr, pert)
-            all_predictions.append(output.cpu().numpy())
-            all_targets.append(target_expr.cpu().numpy())
+            
+            # Convert delta predictions to absolute values for evaluation metrics
+            # target_expr is delta (target - baseline), output is predicted delta
+            target_abs = baseline_expr + target_expr
+            pred_abs = baseline_expr + output
+            all_predictions.append(pred_abs.cpu().numpy())
+            all_targets.append(target_abs.cpu().numpy())
             all_baselines.append(baseline_expr.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
     all_predictions = np.concatenate(all_predictions, axis=0)
@@ -732,6 +745,7 @@ def main(gpu_id=None):
     train_data = np.maximum(train_data, 0)
     train_data = np.maximum(train_data, 1e-10)
     train_data = np.log1p(train_data)
+    # Fit scaler only on training data to prevent data leakage
     scaler = StandardScaler()
     train_data = scaler.fit_transform(train_data)
     train_data = np.clip(train_data, -10, 10)
@@ -741,6 +755,7 @@ def main(gpu_id=None):
         'train_idx': train_gene_idx,
         'test_idx': test_gene_idx
     }
+    # Create training dataset with scaler (will use transform only)
     train_dataset = CITERNADataset(
         train_adata,
         perturbation_key='perturbation',
@@ -752,6 +767,7 @@ def main(gpu_id=None):
         is_train=True,
         common_genes_info=common_genes_info
     )
+    # Create test dataset with same scaler (will use transform only, no fit)
     test_dataset = CITERNADataset(
         test_adata,
         perturbation_key='perturbation',
