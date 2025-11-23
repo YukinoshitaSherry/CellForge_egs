@@ -7,7 +7,6 @@ import scipy
 import anndata
 from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 from tqdm import tqdm
 import os
 import pandas as pd
@@ -36,23 +35,18 @@ test_adata = None
 train_dataset = None
 test_dataset = None
 device = None
-pca_model = None
 scaler = None
 class GeneExpressionDataset(Dataset):
     def __init__(self, adata, perturbation_key='perturbation', dose_key='dose_value',
-                 scaler=None, pca_model=None, pca_dim=128, fit_pca=False,
-                 augment=False, is_train=True, common_genes_info=None,
-                 use_hvg=True, n_hvg=5000, reference_perturbation=None):
+                 scaler=None, augment=False, is_train=True, common_genes_info=None,
+                 reference_perturbation=None):
         self.adata = adata
         self.perturbation_key = perturbation_key
         self.dose_key = dose_key
         self.augment = augment
         self.training = True
-        self.pca_dim = pca_dim
         self.is_train = is_train
         self.common_genes_info = common_genes_info
-        self.use_hvg = use_hvg
-        self.n_hvg = n_hvg
         if common_genes_info is not None:
             if is_train:
                 gene_idx = common_genes_info['train_idx']
@@ -96,8 +90,6 @@ class GeneExpressionDataset(Dataset):
         self.original_expression_data = data.copy()
         self.expression_data = data  
         self.n_genes = data.shape[1]
-        self.pca = pca_model if pca_model is not None else None
-        self.pca_dim = pca_dim if pca_model is not None else None
         self.perturbations = pd.get_dummies(
             adata.obs[perturbation_key]).values.astype(np.float32)
         print_log(
@@ -241,7 +233,7 @@ class GeneExpressionDataset(Dataset):
             else:
                 pert_target = self.perturbations[target_idx]
                 dose_target = self.dose_values[target_idx]
-        x_target_delta = x_target - x_baseline
+        x_target_abs = x_target
         if self.augment and self.training:
             noise = np.random.normal(0, 0.05, x_baseline.shape)
             x_baseline = x_baseline + noise
@@ -250,11 +242,7 @@ class GeneExpressionDataset(Dataset):
         x_baseline = x_baseline.astype(np.float32)
         pert_target = pert_target.astype(np.float32)
         dose_target = np.float32(dose_target)
-        if self.pca is not None:
-            x_target_pca = self.pca.transform(x_target.reshape(1, -1)).flatten()
-        else:
-            x_target_pca = x_target.copy() 
-        return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor([dose_target]), torch.FloatTensor(x_target_delta), torch.FloatTensor(x_target_pca)
+        return torch.FloatTensor(x_baseline), torch.FloatTensor(pert_target), torch.FloatTensor([dose_target]), torch.FloatTensor(x_target_abs)
 class GeneEncoder(nn.Module):
     def __init__(self, input_dim, latent_dim=128, hidden_dim=512, n_heads=8, n_layers=2, dropout=0.1):
         super(GeneEncoder, self).__init__()
@@ -499,9 +487,11 @@ class CondOTGRNModel(nn.Module):
         z_refined = z_control + noise
         z_refined, log_det_jac = self.flow_refiner(z_refined, p)
         x_pred_proj = self.gene_decoder(z_refined)  
-        x_pred = self.output_head(x_pred_proj)  
+        x_pred_delta = self.output_head(x_pred_proj)
+        x_pred = x_control + x_pred_delta
         return {
-            'x_pred': x_pred,  
+            'x_pred': x_pred,
+            'x_pred_delta': x_pred_delta,
             'z_control': z_control,
             'z_refined': z_refined,
             'p': p,
@@ -519,17 +509,15 @@ def train_model(model, train_loader, optimizer, scheduler, device, loss_weights=
             'ot': 0.1,
             'flow': 0.1,
             'de': 0.5,
-            'grn': 0.01,
             'reg': 1e-5
         }
     for i, batch in enumerate(tqdm(train_loader, desc="Training", leave=False)):
-        x_baseline, pert, dose, x_target_delta, x_target_pca = batch
-        x_baseline, pert, dose, x_target_delta, x_target_pca = x_baseline.to(
-            device), pert.to(device), dose.to(device), x_target_delta.to(device), x_target_pca.to(device)
+        x_baseline, pert, dose, x_target_abs = batch
+        x_baseline, pert, dose, x_target_abs = x_baseline.to(
+            device), pert.to(device), dose.to(device), x_target_abs.to(device)
         outputs = model(x_baseline, pert, dose, is_training=True)
-        recon_loss = F.mse_loss(outputs['x_pred'], x_target_delta)
+        recon_loss = F.mse_loss(outputs['x_pred'], x_target_abs)
         with torch.no_grad():
-            x_target_abs = x_baseline + x_target_delta
             if x_target_abs.size(1) == model.input_dim:
                 x_target_proj = model.input_proj(x_target_abs)
             else:
@@ -540,12 +528,21 @@ def train_model(model, train_loader, optimizer, scheduler, device, loss_weights=
         cost_matrix = torch.cdist(outputs['z_control'], z_target, p=2) ** 2
         ot_loss = torch.sum(transport_plan * cost_matrix) / x_baseline.size(0)
         flow_loss = F.mse_loss(outputs['z_refined'], z_ot_pred.detach()) + 0.01 * outputs['log_det_jac'].pow(2).mean()
-        grn_loss = torch.tensor(0.0, device=device)
+        epsilon = 1e-8
+        lfc_true = torch.log2((x_target_abs + epsilon) / (x_baseline + epsilon))
+        lfc_abs = torch.abs(lfc_true)
+        K = min(20, x_target_abs.size(1))
+        top_k_indices = torch.topk(lfc_abs, K, dim=1)[1]
+        de_mask = torch.zeros_like(lfc_abs, dtype=torch.bool)
+        for b in range(x_target_abs.size(0)):
+            de_mask[b, top_k_indices[b]] = True
+        x_target_delta = x_target_abs - x_baseline
+        de_loss = F.mse_loss(outputs['x_pred_delta'][de_mask], x_target_delta[de_mask]) if de_mask.any() else torch.tensor(0.0, device=device)
         reg_loss = sum(p.pow(2.0).mean() for p in model.parameters())
         total_loss_batch = (loss_weights['recon'] * recon_loss +
                             loss_weights['ot'] * ot_loss +
                             loss_weights['flow'] * flow_loss +
-                            loss_weights['grn'] * grn_loss +
+                            loss_weights['de'] * de_loss +
                             loss_weights['reg'] * reg_loss)
         total_loss_batch = total_loss_batch / accumulation_steps
         total_loss_batch.backward()
@@ -567,18 +564,16 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
             'ot': 0.1,
             'flow': 0.1,
             'de': 0.5,
-            'grn': 0.01,
             'reg': 1e-5
         }
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating", leave=False):
-            x_baseline, pert, dose, x_target_delta, x_target_pca = batch
-            x_baseline, pert, dose, x_target_delta, x_target_pca = x_baseline.to(
-                device), pert.to(device), dose.to(device), x_target_delta.to(device), x_target_pca.to(device)
+            x_baseline, pert, dose, x_target_abs = batch
+            x_baseline, pert, dose, x_target_abs = x_baseline.to(
+                device), pert.to(device), dose.to(device), x_target_abs.to(device)
             outputs = model(x_baseline, pert, dose, is_training=False)
-            recon_loss = F.mse_loss(outputs['x_pred'], x_target_delta)
+            recon_loss = F.mse_loss(outputs['x_pred'], x_target_abs)
             with torch.no_grad():
-                x_target_abs = x_baseline + x_target_delta
                 if x_target_abs.size(1) == model.input_dim:
                     x_target_proj = model.input_proj(x_target_abs)
                 else:
@@ -589,18 +584,25 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
             cost_matrix = torch.cdist(outputs['z_control'], z_target, p=2) ** 2
             ot_loss = torch.sum(transport_plan * cost_matrix) / x_baseline.size(0)
             flow_loss = 0.01 * outputs['log_det_jac'].pow(2).mean()
-            grn_loss = torch.tensor(0.0, device=device)
+            epsilon = 1e-8
+            lfc_true = torch.log2((x_target_abs + epsilon) / (x_baseline + epsilon))
+            lfc_abs = torch.abs(lfc_true)
+            K = min(20, x_target_abs.size(1))
+            top_k_indices = torch.topk(lfc_abs, K, dim=1)[1]
+            de_mask = torch.zeros_like(lfc_abs, dtype=torch.bool)
+            for b in range(x_target_abs.size(0)):
+                de_mask[b, top_k_indices[b]] = True
+            x_target_delta = x_target_abs - x_baseline
+            de_loss = F.mse_loss(outputs['x_pred_delta'][de_mask], x_target_delta[de_mask]) if de_mask.any() else torch.tensor(0.0, device=device)
             reg_loss = sum(p.pow(2.0).mean() for p in model.parameters())
             loss = (loss_weights['recon'] * recon_loss +
                     loss_weights['ot'] * ot_loss +
                     loss_weights['flow'] * flow_loss +
-                    loss_weights['grn'] * grn_loss +
+                    loss_weights['de'] * de_loss +
                     loss_weights['reg'] * reg_loss)
             total_loss += loss.item()
-            x_target_abs = x_baseline + x_target_delta
             x_target_np = x_target_abs.cpu().numpy()
-            x_pred_abs = x_baseline + outputs['x_pred']
-            x_pred_np = x_pred_abs.cpu().numpy()
+            x_pred_np = outputs['x_pred'].cpu().numpy()
             if not (np.any(np.isnan(x_target_np)) or np.any(np.isnan(x_pred_np)) or \
                np.any(np.isinf(x_target_np)) or np.any(np.isinf(x_pred_np))):
                 all_targets.append(x_target_np)
@@ -636,15 +638,10 @@ def evaluate_model(model, test_loader, device, loss_weights=None):
 def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None, perturbations=None):
     n_samples, n_genes = true.shape
     mse = np.mean((pred - true) ** 2)
-    true_mean_per_gene = np.mean(true, axis=0)  
-    pred_mean_per_gene = np.mean(pred, axis=0)  
-    true_centered = true - true_mean_per_gene  
-    pred_centered = pred - pred_mean_per_gene  
-    numerator = np.sum(true_centered * pred_centered)
-    true_norm = np.sqrt(np.sum(true_centered ** 2))
-    pred_norm = np.sqrt(np.sum(pred_centered ** 2))
-    if true_norm > 1e-10 and pred_norm > 1e-10:
-        pcc = numerator / (true_norm * pred_norm)
+    pred_flat = pred.flatten()
+    true_flat = true.flatten()
+    if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
+        pcc = pearsonr(true_flat, pred_flat)[0]
         if np.isnan(pcc):
             pcc = 0.0
     else:
@@ -715,15 +712,10 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None,
                     true_de = true_pert[:, de_mask]
                     pred_de = pred_pert[:, de_mask]
                     mse_de_pert = np.mean((pred_de - true_de) ** 2)
-                    true_de_mean_per_gene = np.mean(true_de, axis=0)
-                    pred_de_mean_per_gene = np.mean(pred_de, axis=0)
-                    true_de_centered = true_de - true_de_mean_per_gene
-                    pred_de_centered = pred_de - pred_de_mean_per_gene
-                    numerator_de = np.sum(true_de_centered * pred_de_centered)
-                    true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
-                    pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
-                    if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
-                        pcc_de_pert = numerator_de / (true_de_norm * pred_de_norm)
+                    pred_de_flat = pred_de.flatten()
+                    true_de_flat = true_de.flatten()
+                    if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                        pcc_de_pert = pearsonr(true_de_flat, pred_de_flat)[0]
                         if np.isnan(pcc_de_pert):
                             pcc_de_pert = 0.0
                     else:
@@ -757,15 +749,10 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None,
                 true_de = true[:, de_genes_indices]  
                 pred_de = pred[:, de_genes_indices]  
                 mse_de = np.mean((pred_de - true_de) ** 2)
-                true_de_mean_per_gene = np.mean(true_de, axis=0)  
-                pred_de_mean_per_gene = np.mean(pred_de, axis=0)  
-                true_de_centered = true_de - true_de_mean_per_gene
-                pred_de_centered = pred_de - pred_de_mean_per_gene
-                numerator_de = np.sum(true_de_centered * pred_de_centered)
-                true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
-                pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
-                if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
-                    pcc_de = numerator_de / (true_de_norm * pred_de_norm)
+                pred_de_flat = pred_de.flatten()
+                true_de_flat = true_de.flatten()
+                if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                    pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
                     if np.isnan(pcc_de):
                         pcc_de = 0.0
                 else:
@@ -792,7 +779,7 @@ def calculate_detailed_metrics(pred, true, de_genes=None, control_baseline=None,
         'R2_DE': r2_de
     }
 def objective(trial, timestamp):
-    global train_dataset, test_dataset, device, pca_model, scaler, test_adata
+    global train_dataset, test_dataset, device, scaler, test_adata
     params = {
         'latent_dim': trial.suggest_categorical('latent_dim', [64, 128, 256]),
         'chem_dim': trial.suggest_categorical('chem_dim', [32, 64, 128]),
@@ -890,7 +877,7 @@ def objective(trial, timestamp):
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
     return best_val_loss
-def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None, best_params=None):
+def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, scaler=None, best_params=None):
     model.eval()
     all_predictions = []
     all_targets = []
@@ -898,14 +885,11 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
     all_baselines = []  
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
-            x_baseline, pert, dose, x_target_delta, x_target_pca = batch
-            x_baseline, pert, dose, x_target_delta, x_target_pca = x_baseline.to(
-                device), pert.to(device), dose.to(device), x_target_delta.to(device), x_target_pca.to(device)
+            x_baseline, pert, dose, x_target_abs = batch
+            x_baseline, pert, dose, x_target_abs = x_baseline.to(
+                device), pert.to(device), dose.to(device), x_target_abs.to(device)
             outputs = model(x_baseline, pert, dose, is_training=False)
-            x_pred_delta = outputs['x_pred']  
-            x_pred_abs = x_baseline + x_pred_delta
-            x_target_abs = x_baseline + x_target_delta  
-            all_predictions.append(x_pred_abs.cpu().numpy())
+            all_predictions.append(outputs['x_pred'].cpu().numpy())
             all_targets.append(x_target_abs.cpu().numpy())
             all_perturbations.append(pert.cpu().numpy())
             all_baselines.append(x_baseline.cpu().numpy())
@@ -923,7 +907,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
         'perturbations': all_perturbations,
         'baselines': all_baselines,
         'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
-        'pca_model': pca_model,
+        'common_genes_info': common_genes_info,
         'scaler': scaler,
         'best_params': best_params,
         'model_config': {
@@ -996,7 +980,7 @@ def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_per
     return actual_pert_dim, all_pert_names
 def main(gpu_id=None):
     set_global_seed(42)
-    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler
+    global train_adata, test_adata, train_dataset, test_dataset, device, scaler
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print_log(f'Training started at: {timestamp}')
     if torch.cuda.is_available():
@@ -1048,7 +1032,6 @@ def main(gpu_id=None):
     train_data = scaler.fit_transform(train_data)
     train_data = np.clip(train_data, -10, 10)
     train_data = train_data / 10.0
-    pca_model = None
     print_log("=" * 60)
     print_log("CRITICAL: Training in FULL GENE SPACE")
     print_log(f"Gene count: {len(common_genes)}")
@@ -1071,9 +1054,6 @@ def main(gpu_id=None):
         perturbation_key='perturbation',
         dose_key='dose_value',
         scaler=scaler,
-        pca_model=None,  
-        pca_dim=128,
-        fit_pca=False,
         augment=True,
         is_train=True,
         common_genes_info=common_genes_info,
@@ -1084,9 +1064,6 @@ def main(gpu_id=None):
         perturbation_key='perturbation',
         dose_key='dose_value',
         scaler=scaler,
-        pca_model=None, 
-        pca_dim=128,
-        fit_pca=False,
         augment=False,
         is_train=False,
         common_genes_info=common_genes_info,
@@ -1200,7 +1177,9 @@ def main(gpu_id=None):
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
                 'metrics': val_metrics,
-                'best_params': best_params
+                'best_params': best_params,
+                'scaler': scaler,
+                'common_genes_info': common_genes_info
             }, f'condot_grn_best_model_{timestamp}.pt')
             print_log(f"Saved best model with validation loss: {best_loss:.4f}")
         else:
@@ -1213,7 +1192,7 @@ def main(gpu_id=None):
     results = evaluate_and_save_model(
         final_model, test_loader, device,
         f'condot_grn_final_model_{timestamp}.pt',
-        common_genes_info, pca_model, scaler, best_params
+        common_genes_info, scaler, best_params
     )
     best_params_str = str(best_params)
     if len(best_params_str) > 50:

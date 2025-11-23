@@ -7,7 +7,6 @@ import scipy
 import anndata
 from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 from tqdm import tqdm
 import os
 import pandas as pd
@@ -36,18 +35,15 @@ test_adata = None
 train_dataset = None
 test_dataset = None
 device = None
-pca_model = None
 scaler = None
 common_genes_info = None
 class ControlPerturbedDataset(Dataset):
     def __init__(self, adata, perturbation_key='perturbation', scaler=None,
-                 pca_model=None, pca_dim=128, fit_pca=False, augment=False,
-                 is_train=True, common_genes_info=None, train_control_baseline=None):
+                 augment=False, is_train=True, common_genes_info=None, train_control_baseline=None):
         self.adata = adata
         self.perturbation_key = perturbation_key
         self.augment = augment
         self.is_train = is_train
-        self.pca_dim = pca_dim
         self.common_genes_info = common_genes_info
         self.train_control_baseline = train_control_baseline  
         if common_genes_info is not None:
@@ -93,8 +89,6 @@ class ControlPerturbedDataset(Dataset):
         self.original_expression_data = data.copy()
         self.expression_data = data
         self.n_genes = data.shape[1]
-        self.pca = pca_model if pca_model is not None else None
-        self.pca_dim = pca_dim if pca_model is not None else None
         self._create_control_perturbed_pairs()
         print_log(f"Dataset created: {len(self.pairs)} pairs, {self.expression_data.shape[1]} features")
     def _create_control_perturbed_pairs(self):
@@ -209,7 +203,7 @@ class ControlPerturbedDataset(Dataset):
             x_perturbed = self.expression_data[pair['perturbed_idx']]
             pert = pair['perturbation']
         x_perturbed_original = self.original_expression_data[pair['perturbed_idx']]
-        x_target_delta = x_perturbed_original - x_control
+        x_target_abs = x_perturbed_original
         if self.augment and self.is_train:
             noise = np.random.normal(0, 0.05, x_control.shape)
             x_control = x_control + noise
@@ -217,7 +211,7 @@ class ControlPerturbedDataset(Dataset):
             x_control = x_control * mask
         return (torch.FloatTensor(x_control),
                 torch.FloatTensor(pert),
-                torch.FloatTensor(x_target_delta))
+                torch.FloatTensor(x_target_abs))
     def get_pert_dim(self):
         return self.perturbations.shape[1]
 class VAEEncoder(nn.Module):
@@ -400,20 +394,21 @@ class HybridAttentionModel(nn.Module):
         attended_feat = self.cross_attention(pert_feat, expr_feat, expr_feat)
         x_trans = self.mlp(attended_feat)
         fused = self.fusion(x_trans)
-        output = self.output(fused)
+        delta_pred = self.output(fused)
+        output = x_control + delta_pred
         return output, vae_recon, vae_kl, x_control_proj
-def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.1, vae_beta=1.0, max_pert_dim=None):
+def train_model(model, train_loader, optimizer, scheduler, device, vae_beta=1.0, max_pert_dim=None):
     model.train()
     total_loss = 0
     for batch in train_loader:
-        x_control, pert, x_target_delta = batch
-        x_control, pert, x_target_delta = x_control.to(device), pert.to(device), x_target_delta.to(device)
+        x_control, pert, x_target_abs = batch
+        x_control, pert, x_target_abs = x_control.to(device), pert.to(device), x_target_abs.to(device)
         if max_pert_dim is not None and pert.shape[1] < max_pert_dim:
             pad_size = max_pert_dim - pert.shape[1]
             pert = F.pad(pert, (0, pad_size), mode='constant', value=0)
         optimizer.zero_grad()
         output, vae_recon, vae_kl, x_control_proj = model(x_control, pert)
-        main_loss = F.mse_loss(output, x_target_delta)
+        main_loss = F.mse_loss(output, x_target_abs)
         vae_loss = 0
         if vae_recon is not None:
             vae_loss = F.mse_loss(vae_recon, x_control_proj)
@@ -427,15 +422,10 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
 def calculate_detailed_metrics(pred, true, control_baseline=None, perturbations=None):
     n_samples, n_genes = true.shape
     mse = np.mean((pred - true) ** 2)
-    true_mean_per_gene = np.mean(true, axis=0)
-    pred_mean_per_gene = np.mean(pred, axis=0)
-    true_centered = true - true_mean_per_gene
-    pred_centered = pred - pred_mean_per_gene
-    numerator = np.sum(true_centered * pred_centered)
-    true_norm = np.sqrt(np.sum(true_centered ** 2))
-    pred_norm = np.sqrt(np.sum(pred_centered ** 2))
-    if true_norm > 1e-10 and pred_norm > 1e-10:
-        pcc = numerator / (true_norm * pred_norm)
+    pred_flat = pred.flatten()
+    true_flat = true.flatten()
+    if len(pred_flat) > 1 and np.std(pred_flat) > 1e-10 and np.std(true_flat) > 1e-10:
+        pcc = pearsonr(true_flat, pred_flat)[0]
         if np.isnan(pcc):
             pcc = 0.0
     else:
@@ -476,15 +466,10 @@ def calculate_detailed_metrics(pred, true, control_baseline=None, perturbations=
                     true_de = true_pert[:, de_mask]
                     pred_de = pred_pert[:, de_mask]
                     mse_de_pert = np.mean((pred_de - true_de) ** 2)
-                    true_de_mean_per_gene = np.mean(true_de, axis=0)
-                    pred_de_mean_per_gene = np.mean(pred_de, axis=0)
-                    true_de_centered = true_de - true_de_mean_per_gene
-                    pred_de_centered = pred_de - pred_de_mean_per_gene
-                    numerator_de = np.sum(true_de_centered * pred_de_centered)
-                    true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
-                    pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
-                    if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
-                        pcc_de_pert = numerator_de / (true_de_norm * pred_de_norm)
+                    pred_de_flat = pred_de.flatten()
+                    true_de_flat = true_de.flatten()
+                    if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                        pcc_de_pert = pearsonr(true_de_flat, pred_de_flat)[0]
                         if np.isnan(pcc_de_pert):
                             pcc_de_pert = 0.0
                     else:
@@ -518,15 +503,10 @@ def calculate_detailed_metrics(pred, true, control_baseline=None, perturbations=
                 true_de = true[:, de_genes_indices]
                 pred_de = pred[:, de_genes_indices]
                 mse_de = np.mean((pred_de - true_de) ** 2)
-                true_de_mean_per_gene = np.mean(true_de, axis=0)
-                pred_de_mean_per_gene = np.mean(pred_de, axis=0)
-                true_de_centered = true_de - true_de_mean_per_gene
-                pred_de_centered = pred_de - pred_de_mean_per_gene
-                numerator_de = np.sum(true_de_centered * pred_de_centered)
-                true_de_norm = np.sqrt(np.sum(true_de_centered ** 2))
-                pred_de_norm = np.sqrt(np.sum(pred_de_centered ** 2))
-                if true_de_norm > 1e-10 and pred_de_norm > 1e-10:
-                    pcc_de = numerator_de / (true_de_norm * pred_de_norm)
+                pred_de_flat = pred_de.flatten()
+                true_de_flat = true_de.flatten()
+                if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                    pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
                     if np.isnan(pcc_de):
                         pcc_de = 0.0
                 else:
@@ -554,7 +534,7 @@ def calculate_detailed_metrics(pred, true, control_baseline=None, perturbations=
         'R2_DE': r2_de
     }
 
-def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max_pert_dim=None, test_dataset=None):
+def evaluate_model(model, test_loader, device, vae_beta=1.0, max_pert_dim=None, test_dataset=None):
     model.eval()
     total_loss = 0
     all_targets = []
@@ -563,22 +543,20 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1, vae_beta=1.0, max
     all_perts = []
     with torch.no_grad():
         for batch in test_loader:
-            x_control, pert, x_target_delta = batch
-            x_control, pert, x_target_delta = x_control.to(device), pert.to(device), x_target_delta.to(device)
+            x_control, pert, x_target_abs = batch
+            x_control, pert, x_target_abs = x_control.to(device), pert.to(device), x_target_abs.to(device)
             if max_pert_dim is not None and pert.shape[1] < max_pert_dim:
                 pad_size = max_pert_dim - pert.shape[1]
                 pert = F.pad(pert, (0, pad_size), mode='constant', value=0)
             output, vae_recon, vae_kl, x_control_proj = model(x_control, pert)
-            main_loss = F.mse_loss(output, x_target_delta)
+            main_loss = F.mse_loss(output, x_target_abs)
             vae_loss = 0
             if vae_recon is not None:
                 vae_loss = F.mse_loss(vae_recon, x_control_proj)
             loss = main_loss + vae_beta * vae_kl + 0.1 * vae_loss
             total_loss += loss.item()
-            x_target_abs = x_control + x_target_delta
-            x_pred_abs = x_control + output
             all_targets.append(x_target_abs.cpu().numpy())
-            all_predictions.append(x_pred_abs.cpu().numpy())
+            all_predictions.append(output.cpu().numpy())
             all_controls.append(x_control.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
     all_targets = np.concatenate(all_targets, axis=0)
@@ -673,7 +651,7 @@ def standardize_perturbation_encoding(train_dataset, test_dataset=None, test_per
     print_log(f"All perturbation types: {all_pert_names}")
     return actual_pert_dim, all_pert_names
 def objective(trial):
-    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler, common_genes_info
+    global train_adata, test_adata, train_dataset, test_dataset, device, scaler, common_genes_info
     n_hidden = trial.suggest_categorical('n_hidden', [256, 512, 1024])
     n_layers = trial.suggest_int('n_layers', 1, 3)
     n_heads = trial.suggest_categorical('n_heads', [4, 8])
@@ -697,10 +675,8 @@ def objective(trial):
     train_data = scaler.fit_transform(train_data)
     train_data = np.clip(train_data, -10, 10)
     train_data = train_data / 10.0
-    pca_model = None
     train_dataset = ControlPerturbedDataset(
-        train_adata, scaler=scaler, pca_model=None, pca_dim=128,
-        fit_pca=False, augment=True, is_train=True, common_genes_info=common_genes_info)
+        train_adata, scaler=scaler, augment=True, is_train=True, common_genes_info=common_genes_info)
     test_perturbation_names = list(test_adata.obs['perturbation'].unique())
     pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset=None, test_perturbation_names=test_perturbation_names)
     n_genes = train_dataset.n_genes
@@ -758,7 +734,7 @@ def objective(trial):
     return best_val_loss
 def main(gpu_id=None):
     set_global_seed(42)
-    global train_adata, test_adata, train_dataset, test_dataset, device, pca_model, scaler, common_genes_info
+    global train_adata, test_adata, train_dataset, test_dataset, device, scaler, common_genes_info
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     print_log(f'Training started at: {timestamp}')
     if torch.cuda.is_available():
@@ -795,7 +771,6 @@ def main(gpu_id=None):
     common_genes.sort()
     train_gene_idx = [train_adata.var_names.get_loc(gene) for gene in common_genes]
     test_gene_idx = [test_adata.var_names.get_loc(gene) for gene in common_genes]
-    pca_model = None
     if scipy.sparse.issparse(train_adata.X):
         train_data = train_adata.X[:, train_gene_idx].toarray()
     else:
@@ -816,9 +791,6 @@ def main(gpu_id=None):
         train_adata,
         perturbation_key='perturbation',
         scaler=scaler,
-        pca_model=None,
-        pca_dim=128,
-        fit_pca=False,
         augment=True,
         is_train=True,
         common_genes_info=common_genes_info
@@ -831,9 +803,6 @@ def main(gpu_id=None):
         test_adata,
         perturbation_key='perturbation',
         scaler=scaler,
-        pca_model=None,
-        pca_dim=128,
-        fit_pca=False,
         augment=False,
         is_train=False,
         common_genes_info=common_genes_info,
@@ -849,14 +818,10 @@ def main(gpu_id=None):
     study.optimize(objective, n_trials=50, show_progress_bar=True)
     best_params = study.best_params
     print_log("Training final model with best parameters...")
-    pca_model = None
     train_dataset = ControlPerturbedDataset(
         train_adata,
         perturbation_key='perturbation',
         scaler=scaler,
-        pca_model=None,
-        pca_dim=128,
-        fit_pca=False,
         augment=True,
         is_train=True,
         common_genes_info=common_genes_info
@@ -869,15 +834,12 @@ def main(gpu_id=None):
         test_adata,
         perturbation_key='perturbation',
         scaler=scaler,
-        pca_model=pca_model,
-        pca_dim=128,
-        fit_pca=False,
         augment=False,
         is_train=False,
         common_genes_info=common_genes_info,
         train_control_baseline=train_control_baseline
     )
-    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
+    pert_dim, all_pert_names = standardize_perturbation_encoding(train_dataset, test_dataset)
     n_genes = train_dataset.n_genes
     print_log(f"Model input dim (full genes): {n_genes}, Model output dim (full genes): {n_genes}")
     model = HybridAttentionModel(
@@ -943,7 +905,13 @@ def main(gpu_id=None):
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
                 'metrics': val_metrics,
-                'best_params': best_params
+                'best_params': best_params,
+                'scaler': scaler,
+                'common_genes_info': common_genes_info,
+                'perturbation_encoding': {
+                    'pert_dim': pert_dim,
+                    'all_pert_names': all_pert_names
+                }
             }, f'model_best_{timestamp}.pt')
             print_log(f"Saved best model with validation loss: {best_loss:.4f}")
         else:
@@ -986,7 +954,30 @@ def main(gpu_id=None):
         'loss': test_metrics["loss"],
         'metrics': test_metrics,
         'best_params': best_params,
-        'evaluation_results': test_metrics
+        'evaluation_results': test_metrics,
+        'scaler': scaler,
+        'common_genes_info': common_genes_info,
+        'perturbation_encoding': {
+            'pert_dim': pert_dim,
+            'all_pert_names': all_pert_names
+        },
+        'model_config': {
+            'input_dim': n_genes,
+            'output_dim': n_genes,
+            'pert_dim': pert_dim,
+            'hidden_dim': best_params['n_hidden'],
+            'n_layers': best_params['n_layers'],
+            'n_heads': best_params['n_heads'],
+            'dropout': best_params['dropout'],
+            'attention_dropout': best_params['attention_dropout'],
+            'ffn_dropout': best_params['ffn_dropout'],
+            'use_vae': best_params['use_vae'],
+            'vae_latent_dim': best_params['vae_latent_dim'],
+            'vae_hidden_dim': best_params['vae_hidden_dim'],
+            'use_pert_emb': best_params['use_pert_emb'],
+            'pert_emb_dim': best_params['pert_emb_dim'],
+            'vae_beta': best_params['vae_beta']
+        }
     }, f'model_final_{timestamp}.pt')
     print_log(f"Final model with evaluation results saved to: model_final_{timestamp}.pt")
 if __name__ == "__main__":

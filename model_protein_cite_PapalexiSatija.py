@@ -163,9 +163,6 @@ class CITEProteinDataset(Dataset):
         target_protein = self.protein_data[target_idx]
         perturbation = pair['perturbation']
         
-        # Calculate delta (change from baseline to target)
-        target_delta = target_protein - baseline_protein
-        
         if self.augment and self.training:
             noise = np.random.normal(0, 0.01, baseline_protein.shape)
             baseline_protein = baseline_protein + noise
@@ -173,42 +170,49 @@ class CITEProteinDataset(Dataset):
             baseline_protein = baseline_protein * mask
             scale = np.random.uniform(0.99, 1.01)
             baseline_protein = baseline_protein * scale
-        
-        return (torch.FloatTensor(baseline_protein), 
-                torch.FloatTensor(perturbation), 
-                torch.FloatTensor(target_delta))
+
+        # Return perturbed expression directly as target (not delta)
+        return (torch.FloatTensor(baseline_protein),
+                torch.FloatTensor(perturbation),
+                torch.FloatTensor(target_protein))
 
 class GraphAttentionLayer(nn.Module):
     def __init__(self, in_dim, out_dim, n_heads=4, dropout=0.1):
         super().__init__()
         self.n_heads = n_heads
         self.out_dim = out_dim
-        self.head_dim = out_dim // n_heads
-        
-        self.W = nn.Linear(in_dim, out_dim, bias=False)
-        self.a = nn.Parameter(torch.randn(2 * self.head_dim, 1))
+        # Ensure internal dimension is divisible by n_heads
+        self.head_dim = (out_dim + n_heads - 1) // n_heads
+        self.internal_dim = self.head_dim * n_heads
+
+        self.W = nn.Linear(in_dim, self.internal_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.leaky_relu = nn.LeakyReLU(0.2)
-        
+        # Project back to out_dim if needed
+        if self.internal_dim != out_dim:
+            self.out_proj = nn.Linear(self.internal_dim, out_dim)
+        else:
+            self.out_proj = nn.Identity()
+
     def forward(self, h):
         batch_size, n_nodes, _ = h.shape
-        
+
         Wh = self.W(h)
         Wh = Wh.view(batch_size, n_nodes, self.n_heads, self.head_dim)
-        Wh = Wh.transpose(1, 2)
-        
-        Wh1 = Wh.transpose(2, 3)
-        Wh2 = Wh
-        e = torch.matmul(Wh1, Wh2)
-        e = e.view(batch_size, self.n_heads, n_nodes, n_nodes)
-        
+        Wh = Wh.transpose(1, 2)  # [batch, heads, n_nodes, head_dim]
+
+        # Self-attention: Q @ K^T / sqrt(head_dim)
+        scale = self.head_dim ** -0.5
+        e = torch.matmul(Wh, Wh.transpose(-2, -1)) * scale  # [batch, heads, n_nodes, n_nodes]
+
         attention = F.softmax(self.leaky_relu(e), dim=-1)
         attention = self.dropout(attention)
-        
-        h_prime = torch.matmul(attention, Wh)
+
+        h_prime = torch.matmul(attention, Wh)  # [batch, heads, n_nodes, head_dim]
         h_prime = h_prime.transpose(1, 2).contiguous()
-        h_prime = h_prime.view(batch_size, n_nodes, self.out_dim)
-        
+        h_prime = h_prime.view(batch_size, n_nodes, self.internal_dim)
+        h_prime = self.out_proj(h_prime)
+
         return h_prime
 
 class CrossAttentionModule(nn.Module):
@@ -217,13 +221,17 @@ class CrossAttentionModule(nn.Module):
         self.protein_dim = protein_dim
         self.pert_dim = pert_dim
         self.hidden_dim = hidden_dim
-        
-        self.protein_to_qkv = nn.Linear(protein_dim, 3 * hidden_dim)
-        self.pert_to_qkv = nn.Linear(pert_dim, 3 * hidden_dim)
-        
+
+        # Project to Q, K, V separately for proper cross-attention
+        self.protein_to_q = nn.Linear(protein_dim, hidden_dim)
+        self.pert_to_kv = nn.Linear(pert_dim, 2 * hidden_dim)
+
+        self.pert_to_q = nn.Linear(pert_dim, hidden_dim)
+        self.protein_to_kv = nn.Linear(protein_dim, 2 * hidden_dim)
+
         self.multihead_attn1 = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
         self.multihead_attn2 = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
-        
+
         self.fusion = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -231,20 +239,24 @@ class CrossAttentionModule(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim)
         )
-    
+
     def forward(self, protein_feat, pert_feat):
         protein_seq = protein_feat.unsqueeze(1)
         pert_seq = pert_feat.unsqueeze(1)
-        
-        q1, k1, v1 = self.protein_to_qkv(protein_seq).chunk(3, dim=-1)
-        out1, _ = self.multihead_attn1(q1, pert_seq, pert_seq)
-        
-        q2, k2, v2 = self.pert_to_qkv(pert_seq).chunk(3, dim=-1)
-        out2, _ = self.multihead_attn2(q2, protein_seq, protein_seq)
-        
+
+        # Cross-attention 1: protein attends to perturbation
+        q1 = self.protein_to_q(protein_seq)
+        k1, v1 = self.pert_to_kv(pert_seq).chunk(2, dim=-1)
+        out1, _ = self.multihead_attn1(q1, k1, v1)
+
+        # Cross-attention 2: perturbation attends to protein
+        q2 = self.pert_to_q(pert_seq)
+        k2, v2 = self.protein_to_kv(protein_seq).chunk(2, dim=-1)
+        out2, _ = self.multihead_attn2(q2, k2, v2)
+
         combined = torch.cat([out1.squeeze(1), out2.squeeze(1)], dim=-1)
         fused = self.fusion(combined)
-        
+
         return fused
 
 class ProteinResidualBlock(nn.Module):
@@ -269,8 +281,8 @@ class ProteinResidualBlock(nn.Module):
         return x + residual
 
 class EnhancedProteinModel(nn.Module):
-    def __init__(self, input_dim, pert_dim, hidden_dim=256, n_layers=3, n_heads=4, 
-                 dropout=0.1, attention_dropout=0.1, ffn_dropout=0.1, 
+    def __init__(self, input_dim, pert_dim, hidden_dim=256, n_layers=3, n_heads=4,
+                 dropout=0.1, attention_dropout=0.1, ffn_dropout=0.1,
                  use_gat=True, gat_layers=2, use_cross_attn=True):
         super(EnhancedProteinModel, self).__init__()
         self.input_dim = input_dim
@@ -278,30 +290,38 @@ class EnhancedProteinModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.use_gat = use_gat
         self.use_cross_attn = use_cross_attn
-        
+
+        # Number of tokens for GAT and transformer
+        self.n_gat_nodes = 8  # Split protein features into multiple nodes for GAT
+        self.n_tokens = 8     # Number of tokens for transformer
+
         self.protein_encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
-        
+
         self.protein_residuals = nn.ModuleList([
             ProteinResidualBlock(hidden_dim, dropout) for _ in range(2)
         ])
-        
+
         if use_gat:
+            # Project to multiple nodes for meaningful graph attention
+            self.gat_node_proj = nn.Linear(hidden_dim, self.n_gat_nodes * hidden_dim)
             self.gat_layers = nn.ModuleList()
             for _ in range(gat_layers):
                 self.gat_layers.append(GraphAttentionLayer(hidden_dim, hidden_dim, n_heads, dropout))
-        
+            # Project back from nodes
+            self.gat_node_unproj = nn.Linear(self.n_gat_nodes * hidden_dim, hidden_dim)
+
         self.pert_encoder = nn.Sequential(
             nn.Linear(pert_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
-        
+
         if use_cross_attn:
             self.cross_attention = CrossAttentionModule(
                 hidden_dim, hidden_dim, hidden_dim, n_heads, dropout
@@ -309,24 +329,32 @@ class EnhancedProteinModel(nn.Module):
             fusion_input_dim = hidden_dim
         else:
             fusion_input_dim = hidden_dim * 2
-        
+
         fusion_dim = fusion_input_dim
         self.fusion_dim = ((fusion_dim + n_heads - 1) // n_heads) * n_heads
         if self.fusion_dim != fusion_dim:
             self.fusion_proj = nn.Linear(fusion_dim, self.fusion_dim)
         else:
             self.fusion_proj = nn.Identity()
-        
+
+        # Multi-token transformer setup
+        self.token_dim = ((self.fusion_dim // self.n_tokens + n_heads - 1) // n_heads) * n_heads
+        self.token_proj = nn.Linear(self.fusion_dim, self.n_tokens * self.token_dim)
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.n_tokens, self.token_dim) * 0.02)
+
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.fusion_dim,
+            d_model=self.token_dim,
             nhead=n_heads,
-            dim_feedforward=hidden_dim*2,
+            dim_feedforward=self.token_dim * 4,
             dropout=ffn_dropout,
             activation='gelu',
             batch_first=True,
             norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Project back from tokens
+        self.token_unproj = nn.Linear(self.n_tokens * self.token_dim, self.fusion_dim)
         
         self.fusion = nn.Sequential(
             nn.Linear(self.fusion_dim, hidden_dim),
@@ -367,38 +395,54 @@ class EnhancedProteinModel(nn.Module):
             nn.init.zeros_(module.bias)
     
     def forward(self, x, pert):
+        batch_size = x.size(0)
         protein_feat = self.protein_encoder(x)
-        
+
         for residual_block in self.protein_residuals:
             protein_feat = residual_block(protein_feat)
-        
+
         if self.use_gat:
-            protein_feat_seq = protein_feat.unsqueeze(1)
+            # Project to multiple nodes: [batch, hidden_dim] -> [batch, n_nodes, hidden_dim]
+            nodes = self.gat_node_proj(protein_feat)
+            nodes = nodes.view(batch_size, self.n_gat_nodes, self.hidden_dim)
             for gat_layer in self.gat_layers:
-                protein_feat_seq = gat_layer(protein_feat_seq)
-                protein_feat_seq = F.gelu(protein_feat_seq)
-            protein_feat = protein_feat_seq.squeeze(1)
-        
+                nodes = gat_layer(nodes)
+                nodes = F.gelu(nodes)
+            # Flatten and project back: [batch, n_nodes, hidden_dim] -> [batch, hidden_dim]
+            nodes = nodes.view(batch_size, -1)
+            protein_feat = self.gat_node_unproj(nodes)
+
         pert_feat = self.pert_encoder(pert)
-        
+
         if self.use_cross_attn:
             fusion_input = self.cross_attention(protein_feat, pert_feat)
         else:
             fusion_input = torch.cat([protein_feat, pert_feat], dim=1)
-        
+
         fusion_input = self.fusion_proj(fusion_input)
-        fusion_input = fusion_input.unsqueeze(1)
-        
-        x_trans = self.transformer(fusion_input).squeeze(1)
-        
+
+        # Project and reshape into tokens: [batch, fusion_dim] -> [batch, n_tokens, token_dim]
+        tokens = self.token_proj(fusion_input)
+        tokens = tokens.view(batch_size, self.n_tokens, self.token_dim)
+
+        # Add positional embeddings
+        tokens = tokens + self.pos_embedding
+
+        # Apply transformer encoder
+        x_trans = self.transformer(tokens)
+
+        # Flatten tokens and project back: [batch, n_tokens, token_dim] -> [batch, fusion_dim]
+        x_trans = x_trans.view(batch_size, -1)
+        x_trans = self.token_unproj(x_trans)
+
         fused = self.fusion(x_trans)
-        
+
         for residual_block in self.output_residuals:
             fused = residual_block(fused)
-        
+
         output = self.output(fused)
         pert_pred = self.perturbation_head(fused)
-        
+
         return output, pert_pred
 
 def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.1):
@@ -440,22 +484,19 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
     
     with torch.no_grad():
         for batch in test_loader:
-            baseline_expr, pert, target_delta = batch
-            baseline_expr, pert, target_delta = baseline_expr.to(device), pert.to(device), target_delta.to(device)
-            
+            baseline_expr, pert, target_expr = batch
+            baseline_expr, pert, target_expr = baseline_expr.to(device), pert.to(device), target_expr.to(device)
+
             output, pert_pred = model(baseline_expr, pert)
-            
-            # Compare delta predictions with target delta
-            main_loss = F.mse_loss(output, target_delta)
+
+            # Compare predictions with target perturbed expression
+            main_loss = F.mse_loss(output, target_expr)
             aux_loss = F.mse_loss(pert_pred, pert)
             loss = main_loss + aux_weight * aux_loss
-            
+
             total_loss += loss.item()
-            # Convert to absolute values for evaluation metrics
-            target_abs = baseline_expr + target_delta
-            pred_abs = baseline_expr + output
-            all_targets.append(target_abs.cpu().numpy())
-            all_predictions.append(pred_abs.cpu().numpy())
+            all_targets.append(target_expr.cpu().numpy())
+            all_predictions.append(output.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
             all_pert_preds.append(pert_pred.cpu().numpy())
     
@@ -547,7 +588,7 @@ def calculate_metrics(pred, true, control_baseline=None, perturbations=None, sca
                     pred_de_flat = pred_de.flatten()
                     true_de_flat = true_de.flatten()
                     if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
-                        pcc_de_pert = pearsonr(pred_de_flat, true_de_flat)[0]
+                        pcc_de_pert = pearsonr(true_de_flat, pred_de_flat)[0]
                         if np.isnan(pcc_de_pert):
                             pcc_de_pert = 0.0
                     else:
@@ -577,11 +618,17 @@ def calculate_metrics(pred, true, control_baseline=None, perturbations=None, sca
         de_mask = np.abs(true - np.mean(true, axis=0)) > std
         if np.any(de_mask):
             mse_de = np.mean((pred[de_mask] - true[de_mask]) ** 2)
-            pred_de_flat = pred[de_mask].flatten()
-            true_de_flat = true[de_mask].flatten()
-            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
-                pcc_de = pearsonr(pred_de_flat, true_de_flat)[0]
-                if np.isnan(pcc_de):
+            de_genes_indices = np.where(np.any(de_mask, axis=0))[0]
+            if len(de_genes_indices) > 0:
+                true_de = true[:, de_genes_indices]
+                pred_de = pred[:, de_genes_indices]
+                pred_de_flat = pred_de.flatten()
+                true_de_flat = true_de.flatten()
+                if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                    pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
+                    if np.isnan(pcc_de):
+                        pcc_de = 0.0
+                else:
                     pcc_de = 0.0
             else:
                 pcc_de = 0.0
@@ -663,9 +710,9 @@ def objective(trial, timestamp):
     global train_dataset, test_dataset, device
     
     params = {
-        'n_hidden': trial.suggest_int('n_hidden', 128, 512),
+        'n_hidden': trial.suggest_int('n_hidden', 128, 512, step=8),
         'n_layers': trial.suggest_int('n_layers', 2, 4),
-        'n_heads': trial.suggest_int('n_heads', 2, 8),
+        'n_heads': trial.suggest_categorical('n_heads', [2, 4, 8]),
         'dropout': trial.suggest_float('dropout', 0.05, 0.3),
         'attention_dropout': trial.suggest_float('attention_dropout', 0.05, 0.2),
         'ffn_dropout': trial.suggest_float('ffn_dropout', 0.05, 0.2),
@@ -757,17 +804,13 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
-            baseline_expr, pert, target_delta = batch
-            baseline_expr, pert, target_delta = baseline_expr.to(device), pert.to(device), target_delta.to(device)
-            
+            baseline_expr, pert, target_expr = batch
+            baseline_expr, pert, target_expr = baseline_expr.to(device), pert.to(device), target_expr.to(device)
+
             output, _ = model(baseline_expr, pert)
-            
-            # Convert to absolute values for evaluation
-            target_abs = baseline_expr + target_delta
-            pred_abs = baseline_expr + output
-            
-            all_predictions.append(pred_abs.cpu().numpy())
-            all_targets.append(target_abs.cpu().numpy())
+
+            all_predictions.append(output.cpu().numpy())
+            all_targets.append(target_expr.cpu().numpy())
             all_baselines.append(baseline_expr.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
     
@@ -786,6 +829,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
         'targets': all_targets,
         'baselines': all_baselines,
         'protein_names': common_genes_info['genes'] if common_genes_info is not None else None,
+        'common_genes_info': common_genes_info,
         'scaler': scaler,
         'best_params': best_params,
         'model_config': {
@@ -797,6 +841,10 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
             'dropout': getattr(model, 'dropout', 0.1),
             'use_gat': getattr(model, 'use_gat', True),
             'use_cross_attn': getattr(model, 'use_cross_attn', True)
+        },
+        'perturbation_encoding': {
+            'pert_dim': model.pert_dim,
+            'all_pert_names': all_pert_names
         }
     }, save_path)
     
@@ -836,8 +884,8 @@ def main(gpu_id=None):
         print_log('CUDA not available, using CPU')
     
     print_log('Loading CITE-seq protein data...')
-    train_path = "/datasets/PapalexiSatija2021_eccite_protein_train_unseen.h5ad"
-    test_path = "/datasets/PapalexiSatija2021_eccite_protein_test_unseen.h5ad"
+    train_path = "./datasets/PapalexiSatija2021_train.h5ad"
+    test_path = "./datasets/PapalexiSatija2021_test.h5ad"
     
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(f"Data files not found: {train_path} or {test_path}")
@@ -898,7 +946,7 @@ def main(gpu_id=None):
         common_genes_info=common_genes_info
     )
     
-    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
+    pert_dim, all_pert_names = standardize_perturbation_encoding(train_dataset, test_dataset)
     
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
@@ -994,7 +1042,13 @@ def main(gpu_id=None):
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
                 'metrics': eval_metrics,
-                'best_params': best_params
+                'best_params': best_params,
+                'scaler': scaler,
+                'common_genes_info': common_genes_info,
+                'perturbation_encoding': {
+                    'pert_dim': pert_dim,
+                    'all_pert_names': all_pert_names
+                }
             }, f'cite_protein_best_model_{timestamp}.pt')
             print_log(f"Saved best protein model with loss: {best_loss:.4f}")
         else:
@@ -1007,7 +1061,7 @@ def main(gpu_id=None):
     print_log('Evaluating final protein model on test set...')
     results = evaluate_and_save_model(final_model, test_loader, device,
                                       f'cite_protein_final_model_{timestamp}.pt',
-                                      common_genes_info, scaler, best_params)
+                                      common_genes_info, scaler, best_params, all_pert_names)
     
     best_params_str = str(best_params)
     if len(best_params_str) > 50:

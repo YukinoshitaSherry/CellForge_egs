@@ -83,7 +83,6 @@ class CITERNADataset(Dataset):
                 self.scaler = StandardScaler()
                 data = self.scaler.fit_transform(data)
         else:
-            
             self.scaler = scaler
             if not is_standardized_already:
                 data = self.scaler.transform(data)
@@ -168,8 +167,8 @@ class CITERNADataset(Dataset):
         baseline_expr = self.expression_data[pair['baseline_idx']]
         perturbed_expr = self.original_expression_data[pair['perturbed_idx']]
         perturbation = pair['perturbation']
-        
-        x_target_delta = perturbed_expr - baseline_expr
+        # Target is now perturbed expression directly (not delta)
+        target_expr = perturbed_expr
         if self.augment and self.training:
             noise = np.random.normal(0, 0.05, baseline_expr.shape)
             baseline_expr = baseline_expr + noise
@@ -179,7 +178,7 @@ class CITERNADataset(Dataset):
             baseline_expr = baseline_expr * scale
         return (torch.FloatTensor(baseline_expr),
                 torch.FloatTensor(perturbation),
-                torch.FloatTensor(x_target_delta))
+                torch.FloatTensor(target_expr))
 class PerturbationEmbedding(nn.Module):
     def __init__(self, pert_dim, emb_dim):
         super().__init__()
@@ -251,15 +250,30 @@ class CITERNATransformerModel(nn.Module):
             self.fusion_proj = nn.Linear(fusion_dim, self.fusion_dim)
         else:
             self.fusion_proj = nn.Identity()
-        mlp_layers = []
-        for _ in range(n_layers):
-            mlp_layers.extend([
-                nn.Linear(self.fusion_dim, self.fusion_dim),
-                nn.LayerNorm(self.fusion_dim),
-                nn.GELU(),
-                nn.Dropout(ffn_dropout)
-            ])
-        self.mlp = nn.Sequential(*mlp_layers) if mlp_layers else nn.Identity()
+
+        # Split fusion features into multiple tokens for meaningful attention
+        self.n_tokens = 8
+        self.token_dim = ((self.fusion_dim // self.n_tokens + n_heads - 1) // n_heads) * n_heads
+        self.token_proj = nn.Linear(self.fusion_dim, self.n_tokens * self.token_dim)
+
+        # Learnable positional embeddings
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.n_tokens, self.token_dim) * 0.02)
+
+        # Real transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.token_dim,
+            nhead=n_heads,
+            dim_feedforward=self.token_dim * 4,
+            dropout=ffn_dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Project back from tokens to fusion dim
+        self.token_unproj = nn.Linear(self.n_tokens * self.token_dim, self.fusion_dim)
+
         self.fusion = nn.Sequential(
             nn.Linear(self.fusion_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -292,12 +306,27 @@ class CITERNATransformerModel(nn.Module):
     def forward(self, baseline_expr, pert):
         assert baseline_expr.dim() == 2 and baseline_expr.size(1) == self.input_dim, \
             f"Expected baseline_expr shape [B, {self.input_dim}], got {baseline_expr.shape}"
+        batch_size = baseline_expr.size(0)
         baseline_expr_proj = self.input_proj(baseline_expr)
         expr_feat = self.expression_encoder(baseline_expr_proj)
         pert_feat = self.pert_encoder(pert)
         fusion_input = torch.cat([expr_feat, pert_feat], dim=1)
         fusion_input = self.fusion_proj(fusion_input)
-        x_trans = self.mlp(fusion_input)
+
+        # Project and reshape into tokens: [batch, fusion_dim] -> [batch, n_tokens, token_dim]
+        tokens = self.token_proj(fusion_input)
+        tokens = tokens.view(batch_size, self.n_tokens, self.token_dim)
+
+        # Add positional embeddings
+        tokens = tokens + self.pos_embedding
+
+        # Apply transformer encoder
+        x_trans = self.transformer(tokens)
+
+        # Flatten tokens and project back: [batch, n_tokens, token_dim] -> [batch, fusion_dim]
+        x_trans = x_trans.view(batch_size, -1)
+        x_trans = self.token_unproj(x_trans)
+
         fused = self.fusion(x_trans)
         output = self.output(fused)
         pert_pred = self.perturbation_head(fused)
@@ -311,11 +340,8 @@ def train_model(model, train_loader, optimizer, scheduler, device, aux_weight=0.
         baseline_expr, pert, target_expr = batch
         baseline_expr, pert, target_expr = baseline_expr.to(
             device), pert.to(device), target_expr.to(device)
-        
         output, pert_pred = model(baseline_expr, pert)
-        
         main_loss = F.mse_loss(output, target_expr)
-        
         aux_loss = F.mse_loss(pert_pred, pert)
         loss = main_loss + aux_weight * aux_loss
         loss = loss / accumulation_steps
@@ -339,14 +365,11 @@ def evaluate_model(model, test_loader, device, aux_weight=0.1):
             baseline_expr, pert, target_expr = batch
             baseline_expr, pert, target_expr = baseline_expr.to(
                 device), pert.to(device), target_expr.to(device)
-            
             output, pert_pred = model(baseline_expr, pert)
-            
             main_loss = F.mse_loss(output, target_expr)
             aux_loss = F.mse_loss(pert_pred, pert)
             loss = main_loss + aux_weight * aux_loss
             total_loss += loss.item()
-            
             all_targets.append(target_expr.cpu().numpy())
             all_predictions.append(output.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
@@ -454,11 +477,17 @@ def calculate_metrics(pred, true, control_baseline=None, perturbations=None):
         de_mask = np.abs(true - np.mean(true, axis=0)) > std
         if np.any(de_mask):
             mse_de = np.mean((pred[de_mask] - true[de_mask]) ** 2)
-            pred_de_flat = pred[de_mask].flatten()
-            true_de_flat = true[de_mask].flatten()
-            if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
-                pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
-                if np.isnan(pcc_de):
+            de_genes_indices = np.where(np.any(de_mask, axis=0))[0]
+            if len(de_genes_indices) > 0:
+                true_de = true[:, de_genes_indices]
+                pred_de = pred[:, de_genes_indices]
+                pred_de_flat = pred_de.flatten()
+                true_de_flat = true_de.flatten()
+                if len(pred_de_flat) > 1 and np.std(pred_de_flat) > 1e-10 and np.std(true_de_flat) > 1e-10:
+                    pcc_de = pearsonr(true_de_flat, pred_de_flat)[0]
+                    if np.isnan(pcc_de):
+                        pcc_de = 0.0
+                else:
                     pcc_de = 0.0
             else:
                 pcc_de = 0.0
@@ -534,9 +563,9 @@ def objective(trial, timestamp):
     global train_dataset, test_dataset, device, pca_model, test_adata
     params = {
         'pca_dim': 128,
-        'n_hidden': trial.suggest_int('n_hidden', 256, 1024),
+        'n_hidden': trial.suggest_int('n_hidden', 256, 1024, step=8),
         'n_layers': trial.suggest_int('n_layers', 2, 4),
-        'n_heads': trial.suggest_int('n_heads', 4, 8),
+        'n_heads': trial.suggest_categorical('n_heads', [4, 8]),
         'dropout': trial.suggest_float('dropout', 0.1, 0.3),
         'attention_dropout': trial.suggest_float('attention_dropout', 0.1, 0.2),
         'ffn_dropout': trial.suggest_float('ffn_dropout', 0.1, 0.2),
@@ -638,7 +667,7 @@ def objective(trial, timestamp):
             print(
                 f'Epoch {epoch+1}/{max_epochs} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f}')
     return best_val_loss
-def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None, best_params=None):
+def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_info=None, pca_model=None, scaler=None, best_params=None, all_pert_names=None):
     model.eval()
     all_predictions = []
     all_targets = []
@@ -650,13 +679,8 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
             baseline_expr, pert, target_expr = baseline_expr.to(
                 device), pert.to(device), target_expr.to(device)
             output, _ = model(baseline_expr, pert)
-            
-            
-            
-            target_abs = baseline_expr + target_expr
-            pred_abs = baseline_expr + output
-            all_predictions.append(pred_abs.cpu().numpy())
-            all_targets.append(target_abs.cpu().numpy())
+            all_predictions.append(output.cpu().numpy())
+            all_targets.append(target_expr.cpu().numpy())
             all_baselines.append(baseline_expr.cpu().numpy())
             all_perts.append(pert.cpu().numpy())
     all_predictions = np.concatenate(all_predictions, axis=0)
@@ -672,6 +696,7 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
         'targets': all_targets,
         'baselines': all_baselines,
         'gene_names': common_genes_info['genes'] if common_genes_info is not None else None,
+        'common_genes_info': common_genes_info,
         'pca_model': pca_model,
         'scaler': scaler,
         'best_params': best_params,
@@ -683,6 +708,10 @@ def evaluate_and_save_model(model, test_loader, device, save_path, common_genes_
             'n_heads': getattr(model, 'n_heads', 8),
             'dropout': getattr(model, 'dropout', 0.1),
             'use_pert_emb': getattr(model, 'use_pert_emb', True)
+        },
+        'perturbation_encoding': {
+            'pert_dim': model.pert_dim,
+            'all_pert_names': all_pert_names
         }
     }, save_path)
     metrics_df = pd.DataFrame({
@@ -716,8 +745,8 @@ def main(gpu_id=None):
         device = torch.device('cpu')
         print('CUDA not available, using CPU')
     print('Loading CITE-seq RNA data...')
-    train_path = "/datasets/PapalexiSatija2021_eccite_RNA_train_filtered2.h5ad"
-    test_path = "/datasets/PapalexiSatija2021_eccite_RNA_test_filtered2.h5ad"
+    train_path = "./datasets/PapalexiSatija2021_train.h5ad"
+    test_path = "./datasets/PapalexiSatija2021_test.h5ad"
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         raise FileNotFoundError(
             f"Data files not found: {train_path} or {test_path}")
@@ -745,7 +774,6 @@ def main(gpu_id=None):
     train_data = np.maximum(train_data, 0)
     train_data = np.maximum(train_data, 1e-10)
     train_data = np.log1p(train_data)
-    
     scaler = StandardScaler()
     train_data = scaler.fit_transform(train_data)
     train_data = np.clip(train_data, -10, 10)
@@ -755,7 +783,6 @@ def main(gpu_id=None):
         'train_idx': train_gene_idx,
         'test_idx': test_gene_idx
     }
-    
     train_dataset = CITERNADataset(
         train_adata,
         perturbation_key='perturbation',
@@ -767,7 +794,6 @@ def main(gpu_id=None):
         is_train=True,
         common_genes_info=common_genes_info
     )
-    
     test_dataset = CITERNADataset(
         test_adata,
         perturbation_key='perturbation',
@@ -779,7 +805,7 @@ def main(gpu_id=None):
         is_train=False,
         common_genes_info=common_genes_info
     )
-    pert_dim, _ = standardize_perturbation_encoding(train_dataset, test_dataset)
+    pert_dim, all_pert_names = standardize_perturbation_encoding(train_dataset, test_dataset)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
         direction='minimize',
@@ -866,7 +892,13 @@ def main(gpu_id=None):
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': best_loss,
                 'metrics': val_metrics,
-                'best_params': best_params
+                'best_params': best_params,
+                'scaler': scaler,
+                'common_genes_info': common_genes_info,
+                'perturbation_encoding': {
+                    'pert_dim': pert_dim,
+                    'all_pert_names': all_pert_names
+                }
             }, f'cite_rna_best_model_{timestamp}.pt')
             print(f"Saved best RNA model with validation loss: {best_loss:.4f}")
         else:
@@ -878,7 +910,7 @@ def main(gpu_id=None):
     print_log('Evaluating final RNA model on test set...')
     results = evaluate_and_save_model(final_model, test_loader, device,
                                       f'cite_rna_final_model_{timestamp}.pt',
-                                      common_genes_info, pca_model, scaler, best_params)
+                                      common_genes_info, pca_model, scaler, best_params, all_pert_names)
     
     best_params_str = str(best_params)
     if len(best_params_str) > 50:
